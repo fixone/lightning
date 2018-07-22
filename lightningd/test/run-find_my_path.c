@@ -11,6 +11,10 @@ void activate_peers(struct lightningd *ld UNNEEDED)
 /* Generated stub for begin_topology */
 void begin_topology(struct chain_topology *topo UNNEEDED)
 { fprintf(stderr, "begin_topology called!\n"); abort(); }
+/* Generated stub for channel_notify_new_block */
+void channel_notify_new_block(struct lightningd *ld UNNEEDED,
+			      u32 block_height UNNEEDED)
+{ fprintf(stderr, "channel_notify_new_block called!\n"); abort(); }
 /* Generated stub for daemon_setup */
 void daemon_setup(const char *argv0 UNNEEDED,
 		  void (*backtrace_print)(const char *fmt UNNEEDED, ...) UNNEEDED,
@@ -58,6 +62,9 @@ size_t hash_htlc_key(const struct htlc_key *htlc_key UNNEEDED)
 /* Generated stub for hsm_init */
 void hsm_init(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "hsm_init called!\n"); abort(); }
+/* Generated stub for htlcs_notify_new_block */
+void htlcs_notify_new_block(struct lightningd *ld UNNEEDED, u32 height UNNEEDED)
+{ fprintf(stderr, "htlcs_notify_new_block called!\n"); abort(); }
 /* Generated stub for json_escape */
 struct json_escaped *json_escape(const tal_t *ctx UNNEEDED, const char *str TAKES UNNEEDED)
 { fprintf(stderr, "json_escape called!\n"); abort(); }
@@ -94,9 +101,8 @@ void setup_color_and_alias(struct lightningd *ld UNNEEDED)
 void setup_jsonrpc(struct lightningd *ld UNNEEDED, const char *rpc_filename UNNEEDED)
 { fprintf(stderr, "setup_jsonrpc called!\n"); abort(); }
 /* Generated stub for setup_topology */
-void setup_topology(struct chain_topology *topology UNNEEDED,
-		    struct timers *timers UNNEEDED,
-		    struct timerel poll_time UNNEEDED, u32 first_channel_block UNNEEDED)
+void setup_topology(struct chain_topology *topology UNNEEDED, struct timers *timers UNNEEDED,
+		    u32 min_blockheight UNNEEDED, u32 max_blockheight UNNEEDED)
 { fprintf(stderr, "setup_topology called!\n"); abort(); }
 /* Generated stub for subd_shutdown */
 void subd_shutdown(struct subd *subd UNNEEDED, unsigned int seconds UNNEEDED)
@@ -114,9 +120,9 @@ struct txfilter *txfilter_new(const tal_t *ctx UNNEEDED)
 /* Generated stub for version */
 const char *version(void)
 { fprintf(stderr, "version called!\n"); abort(); }
-/* Generated stub for wallet_blocks_height */
-u32 wallet_blocks_height(struct wallet *w UNNEEDED, u32 def UNNEEDED)
-{ fprintf(stderr, "wallet_blocks_height called!\n"); abort(); }
+/* Generated stub for wallet_blocks_heights */
+void wallet_blocks_heights(struct wallet *w UNNEEDED, u32 def UNNEEDED, u32 *min UNNEEDED, u32 *max UNNEEDED)
+{ fprintf(stderr, "wallet_blocks_heights called!\n"); abort(); }
 /* Generated stub for wallet_channels_load_active */
 bool wallet_channels_load_active(const tal_t *ctx UNNEEDED, struct wallet *w UNNEEDED)
 { fprintf(stderr, "wallet_channels_load_active called!\n"); abort(); }

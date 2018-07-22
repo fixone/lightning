@@ -1,5 +1,6 @@
 #include <common/cryptomsg.h>
 #include <common/channel_config.h>
+#include <common/derive_basepoints.h>
 
 # Begin!  (passes gossipd-client fd)
 channel_init,1000
@@ -16,17 +17,14 @@ channel_init,,feerate_max,u32
 channel_init,,first_commit_sig,secp256k1_ecdsa_signature
 channel_init,,crypto_state,struct crypto_state
 channel_init,,remote_fundingkey,struct pubkey
-channel_init,,remote_revocation_basepoint,struct pubkey
-channel_init,,remote_payment_basepoint,struct pubkey
-channel_init,,remote_htlc_basepoint,struct pubkey
-channel_init,,remote_delayed_payment_basepoint,struct pubkey
+channel_init,,remote_basepoints,struct basepoints
 channel_init,,remote_per_commit,struct pubkey
 channel_init,,old_remote_per_commit,struct pubkey
 channel_init,,funder,enum side
 channel_init,,fee_base,u32
 channel_init,,fee_proportional,u32
 channel_init,,local_msatoshi,u64
-channel_init,,seed,struct privkey
+channel_init,,seed,struct secret
 channel_init,,local_node_id,struct pubkey
 channel_init,,remote_node_id,struct pubkey
 channel_init,,commit_msec,u32
@@ -60,12 +58,10 @@ channel_init,,init_peer_pkt_len,u16
 channel_init,,init_peer_pkt,init_peer_pkt_len*u8
 channel_init,,reached_announce_depth,bool
 
-# Tx is deep enough, go!
+# master->channeld funding hit new depth >= lock depth
 channel_funding_locked,1002
 channel_funding_locked,,short_channel_id,struct short_channel_id
-
-# Tell the channel that we may announce the channel's existence
-channel_funding_announce_depth,1003
+channel_funding_locked,,depth,u32
 
 # Tell channel to offer this htlc
 channel_offer_htlc,1004
@@ -153,7 +149,7 @@ channel_got_commitsig_reply,1121
 
 channel_got_revoke,1022
 channel_got_revoke,,revokenum,u64
-channel_got_revoke,,per_commitment_secret,struct sha256
+channel_got_revoke,,per_commitment_secret,struct secret
 channel_got_revoke,,next_per_commit_point,struct pubkey
 # RCVD_ADD_ACK_REVOCATION, RCVD_REMOVE_ACK_REVOCATION, RCVD_ADD_REVOCATION, RCVD_REMOVE_REVOCATION
 channel_got_revoke,,num_changed,u16

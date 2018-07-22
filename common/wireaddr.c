@@ -151,6 +151,7 @@ bool wireaddr_to_ipv4(const struct wireaddr *addr, struct sockaddr_in *s4)
 {
 	if (addr->type != ADDR_TYPE_IPV4)
 		return false;
+	memset(s4, 0, sizeof(*s4));
 	s4->sin_family = AF_INET;
 	s4->sin_port = htons(addr->port);
 	assert(addr->addrlen == sizeof(s4->sin_addr));
@@ -162,6 +163,7 @@ bool wireaddr_to_ipv6(const struct wireaddr *addr, struct sockaddr_in6 *s6)
 {
 	if (addr->type != ADDR_TYPE_IPV6)
 		return false;
+	memset(s6, 0, sizeof(*s6));
 	s6->sin6_family = AF_INET6;
 	s6->sin6_port = htons(addr->port);
 	assert(addr->addrlen == sizeof(s6->sin6_addr));
@@ -207,7 +209,7 @@ REGISTER_TYPE_TO_STRING(wireaddr_internal, fmt_wireaddr_internal);
 char *fmt_wireaddr_without_port(const tal_t * ctx, const struct wireaddr *a)
 {
 	char *ret, *hex;
-	char addrstr[LARGEST_ADDRLEN];
+	char addrstr[INET6_ADDRSTRLEN];
 
 	switch (a->type) {
 	case ADDR_TYPE_IPV4:
@@ -288,6 +290,7 @@ static bool separate_address_and_port(const tal_t *ctx, const char *arg,
 
 bool wireaddr_from_hostname(struct wireaddr *addr, const char *hostname,
 			    const u16 port, bool *no_dns,
+			    struct sockaddr *broken_reply,
 			    const char **err_msg)
 {
 	struct sockaddr_in6 *sa6;
@@ -340,6 +343,12 @@ bool wireaddr_from_hostname(struct wireaddr *addr, const char *hostname,
 			*err_msg = gai_strerror(gai_err);
 		return false;
 	}
+
+	if (broken_reply != NULL && memeq(addrinfo->ai_addr, addrinfo->ai_addrlen, broken_reply, tal_len(broken_reply))) {
+		res = false;
+		goto cleanup;
+	}
+
 	/* Use only the first found address */
 	if (addrinfo->ai_family == AF_INET) {
 		sa4 = (struct sockaddr_in *) addrinfo->ai_addr;
@@ -351,6 +360,7 @@ bool wireaddr_from_hostname(struct wireaddr *addr, const char *hostname,
 		res = true;
 	}
 
+cleanup:
 	/* Clean up */
 	freeaddrinfo(addrinfo);
 	return res;
@@ -390,7 +400,7 @@ bool parse_wireaddr(const char *arg, struct wireaddr *addr, u16 defport,
 
 	/* Resolve with getaddrinfo */
 	if (!res)
-		res = wireaddr_from_hostname(addr, ip, port, no_dns, err_msg);
+		res = wireaddr_from_hostname(addr, ip, port, no_dns, NULL, err_msg);
 
 finish:
 	if (!res && err_msg && !*err_msg)

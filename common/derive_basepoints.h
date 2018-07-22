@@ -32,11 +32,56 @@ struct secrets {
  * @secrets: (out) basepoints for channel (if non-NULL)
  * @shaseed: (out) seed for shachain (if non-NULL)
  */
-bool derive_basepoints(const struct privkey *seed,
+bool derive_basepoints(const struct secret *seed,
 		       struct pubkey *funding_pubkey,
 		       struct basepoints *basepoints,
 		       struct secrets *secrets,
 		       struct sha256 *shaseed);
+
+/**
+ * derive_funding_key - give a (per-peer) seed, get just funding key
+ * @seed: (in) seed (derived by master daemon from counter and main seed)
+ * @funding_pubkey: (out) pubkey for funding tx output (if non-NULL)
+ * @funding_privkey: (out) privkey for funding tx output (if non-NULL)
+ *
+ * This is a cut-down version of derive_basepoints.
+ */
+bool derive_funding_key(const struct secret *seed,
+			struct pubkey *funding_pubkey,
+			struct privkey *funding_privkey);
+
+/**
+ * derive_payment_basepoint - give a (per-channel) seed, get just payment basepoint
+ * @seed: (in) seed (derived by master daemon from counter and main seed)
+ * @payment_basepoint: (out) basepoint for payment output (if non-NULL)
+ * @payment_secret: (out) secret for payment basepoint (if non-NULL)
+ *
+ * This is a cut-down version of derive_basepoints.
+ */
+bool derive_payment_basepoint(const struct secret *seed,
+			      struct pubkey *payment_basepoint,
+			      struct secret *payment_secret);
+
+/**
+ * derive_shaseed - give a (per-peer) seed, get just the shaseed
+ * @seed: (in) seed (derived by master daemon from counter and main seed)
+ * @shaseed: (out) seed for shachain
+ *
+ * This is a cut-down version of derive_basepoints.
+ */
+bool derive_shaseed(const struct secret *seed, struct sha256 *shaseed);
+
+/**
+ * derive_delayed_payment_basepoint - give a (per-channel) seed, get just delayed payment basepoint
+ * @seed: (in) seed (derived by master daemon from counter and main seed)
+ * @delayed_payment_basepoint: (out) basepoint for payment output (if non-NULL)
+ * @delayed_payment_secret: (out) secret for payment basepoint (if non-NULL)
+ *
+ * This is a cut-down version of derive_basepoints.
+ */
+bool derive_delayed_payment_basepoint(const struct secret *seed,
+			      struct pubkey *delayed_payment_basepoint,
+			      struct secret *delayed_payment_secret);
 
 /**
  * per_commit_secret - get a secret for this index.
@@ -45,7 +90,7 @@ bool derive_basepoints(const struct privkey *seed,
  * @per_commit_index: (in) which @commit_secret to return.
  */
 void per_commit_secret(const struct sha256 *shaseed,
-		       struct sha256 *commit_secret,
+		       struct secret *commit_secret,
 		       u64 per_commit_index);
 
 /**
@@ -60,8 +105,9 @@ bool per_commit_point(const struct sha256 *shaseed,
 
 /* BOLT #3:
  *
- * the first secret used MUST be index 281474976710655, and then the index
- * decremented.
+ * The first secret used:
+ *   - MUST be index 281474976710655,
+ *     - and from there, the index is decremented.
  */
 static inline u64 shachain_index(u64 per_commit_index)
 {
@@ -74,4 +120,9 @@ static inline u64 revocations_received(const struct shachain *shachain)
 {
 	return (1ULL << SHACHAIN_BITS) - (shachain_next_index(shachain) + 1);
 }
+
+void towire_basepoints(u8 **pptr, const struct basepoints *b);
+void fromwire_basepoints(const u8 **ptr, size_t *max,
+			 struct basepoints *b);
+
 #endif /* LIGHTNING_COMMON_DERIVE_BASEPOINTS_H */

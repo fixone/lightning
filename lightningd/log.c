@@ -15,8 +15,10 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <lightningd/jsonrpc.h>
+#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/options.h>
+#include <lightningd/param.h>
 #include <signal.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -255,8 +257,10 @@ void logv(struct log *log, enum log_level level, const char *fmt, va_list ap)
 
 	l->log = tal_vfmt(l, fmt, ap);
 
+	size_t log_len = strlen(l->log);
+
 	/* Sanitize any non-printable characters, and replace with '?' */
-	for (size_t i=0; i<strlen(l->log); i++)
+	for (size_t i=0; i<log_len; i++)
 		if (l->log[i] < ' ' || l->log[i] >= 0x7f)
 			l->log[i] = '?';
 
@@ -653,18 +657,11 @@ static void json_getlog(struct command *cmd,
 	struct json_result *response = new_json_result(cmd);
 	enum log_level minlevel;
 	struct log_book *lr = cmd->ld->log_book;
-	jsmntok_t *level;
 
-	if (!json_get_params(cmd, buffer, params, "?level", &level, NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_opt_def("level", json_tok_loglevel, &minlevel, LOG_INFORM),
+		   NULL))
 		return;
-	}
-
-	if (!level)
-		minlevel = LOG_INFORM;
-	else if (!json_tok_loglevel(buffer, level, &minlevel)) {
-		command_fail(cmd, "Invalid level param");
-		return;
-	}
 
 	json_object_start(response, NULL);
 	if (deprecated_apis)

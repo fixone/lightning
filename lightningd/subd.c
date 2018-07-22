@@ -135,7 +135,6 @@ static void close_taken_fds(va_list *ap)
 /* We use sockets, not pipes, because fds are bidir. */
 static int subd(const char *dir, const char *name,
 		const char *debug_subdaemon,
-		const char *debug_subdaemon_io,
 		int *msgfd, int dev_disconnect_fd, va_list *ap)
 {
 	int childmsg[2], execfail[2];
@@ -160,7 +159,7 @@ static int subd(const char *dir, const char *name,
 		int fdnum = 3, i, stdin_is_now = STDIN_FILENO;
 		long max;
 		size_t num_args;
-		char *args[] = { NULL, NULL, NULL, NULL, NULL };
+		char *args[] = { NULL, NULL, NULL, NULL };
 
 		close(childmsg[0]);
 		close(execfail[0]);
@@ -181,16 +180,14 @@ static int subd(const char *dir, const char *name,
 		}
 
 		/* Dup any extra fds up first. */
-		if (ap) {
-			while ((fd = va_arg(*ap, int *)) != NULL) {
-				int actual_fd = *fd;
-				/* If this were stdin, we moved it above! */
-				if (actual_fd == STDIN_FILENO)
-					actual_fd = stdin_is_now;
-				if (!move_fd(actual_fd, fdnum))
-					goto child_errno_fail;
-				fdnum++;
-			}
+		while ((fd = va_arg(*ap, int *)) != NULL) {
+			int actual_fd = *fd;
+			/* If this were stdin, we moved it above! */
+			if (actual_fd == STDIN_FILENO)
+				actual_fd = stdin_is_now;
+			if (!move_fd(actual_fd, fdnum))
+				goto child_errno_fail;
+			fdnum++;
 		}
 
 		/* Make (fairly!) sure all other fds are closed. */
@@ -207,8 +204,6 @@ static int subd(const char *dir, const char *name,
 		if (debug_subdaemon && strends(name, debug_subdaemon))
 			args[num_args++] = "--debugger";
 #endif
-		if (debug_subdaemon_io && strends(name, debug_subdaemon_io))
-			args[num_args++] = "--log-io";
 		execv(args[0], args);
 
 	child_errno_fail:
@@ -247,30 +242,6 @@ fail:
 	if (ap)
 		close_taken_fds(ap);
 	return -1;
-}
-
-int subd_raw(struct lightningd *ld, const char *name)
-{
-	pid_t pid;
-	int msg_fd;
-	const char *debug_subd = NULL;
-	int disconnect_fd = -1;
-
-#if DEVELOPER
-	debug_subd = ld->dev_debug_subdaemon;
-	disconnect_fd = ld->dev_disconnect_fd;
-#endif /* DEVELOPER */
-
-	pid = subd(ld->daemon_dir, name, debug_subd, ld->debug_subdaemon_io,
-		   &msg_fd, disconnect_fd,
-		   NULL);
-	if (pid == (pid_t)-1) {
-		log_unusual(ld->log, "subd %s failed: %s",
-			    name, strerror(errno));
-		return -1;
-	}
-
-	return msg_fd;
 }
 
 static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd);
@@ -658,7 +629,7 @@ static struct subd *new_subd(struct lightningd *ld,
 	disconnect_fd = ld->dev_disconnect_fd;
 #endif /* DEVELOPER */
 
-	sd->pid = subd(ld->daemon_dir, name, debug_subd, ld->debug_subdaemon_io,
+	sd->pid = subd(ld->daemon_dir, name, debug_subd,
 		       &msg_fd, disconnect_fd, ap);
 	if (sd->pid == (pid_t)-1) {
 		log_unusual(ld->log, "subd %s failed: %s",

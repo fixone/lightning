@@ -20,10 +20,11 @@
 #include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/jsonrpc.h>
+#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
-#include <lightningd/opt_time.h>
 #include <lightningd/options.h>
+#include <lightningd/param.h>
 #include <lightningd/subd.h>
 #include <stdio.h>
 #include <string.h>
@@ -181,7 +182,36 @@ static char *opt_add_bind_addr(const char *arg, struct lightningd *ld)
 
 static char *opt_add_announce_addr(const char *arg, struct lightningd *ld)
 {
-	return opt_add_addr_withtype(arg, ld, ADDR_ANNOUNCE, false);
+	const struct wireaddr *wn;
+	size_t n = tal_count(ld->proposed_wireaddr);
+	char *err = opt_add_addr_withtype(arg, ld, ADDR_ANNOUNCE, false);
+	if (err)
+		return err;
+
+	/* Can't announce anything that's not a normal wireaddr. */
+	if (ld->proposed_wireaddr[n].itype != ADDR_INTERNAL_WIREADDR)
+		return tal_fmt(NULL, "address '%s' is not announcable",
+			       arg);
+
+	/* gossipd will refuse to announce the second one, sure, but it's
+	 * better to check and fail now if they've explicitly asked for it. */
+	wn = &ld->proposed_wireaddr[n].u.wireaddr;
+	for (size_t i = 0; i < n; i++) {
+		const struct wireaddr *wi;
+
+		if (ld->proposed_listen_announce[i] != ADDR_ANNOUNCE)
+			continue;
+		assert(ld->proposed_wireaddr[i].itype == ADDR_INTERNAL_WIREADDR);
+		wi = &ld->proposed_wireaddr[i].u.wireaddr;
+
+		if (wn->type != wi->type)
+			continue;
+		return tal_fmt(NULL, "Cannot announce address %s;"
+			       " already have %s which is the same type",
+			       type_to_string(tmpctx, struct wireaddr, wn),
+			       type_to_string(tmpctx, struct wireaddr, wi));
+	}
+	return NULL;
 }
 
 static char *opt_add_ipaddr(const char *arg, struct lightningd *ld)
@@ -239,8 +269,9 @@ static char *opt_set_rgb(const char *arg, struct lightningd *ld)
 	ld->rgb = tal_free(ld->rgb);
 	/* BOLT #7:
 	 *
-	 * the first byte of `rgb` is the red value, the second byte is the
-	 * green value and the last byte is the blue value */
+	 *    - Note: the first byte of `rgb_color` is the red value, the second
+	 *      byte is the green value, and the last byte is the blue value.
+	 */
 	ld->rgb = tal_hexdata(ld, arg, strlen(arg));
 	if (!ld->rgb || tal_len(ld->rgb) != 3)
 		return tal_fmt(NULL, "rgb '%s' is not six hex digits", arg);
@@ -256,36 +287,13 @@ static char *opt_set_alias(const char *arg, struct lightningd *ld)
 	 *
 	 *    * [`32`:`alias`]
 	 *...
-	 * It MUST set `alias` to a valid UTF-8 string, with any `alias` bytes
-	 * following equal to zero.
+	 *  - MUST set `alias` to a valid UTF-8 string, with any
+	 *   `alias` trailing-bytes equal to 0.
 	 */
 	if (strlen(arg) > 32)
 		return tal_fmt(NULL, "Alias '%s' is over 32 characters", arg);
 	ld->alias = tal_arrz(ld, u8, 33);
 	strncpy((char*)ld->alias, arg, 32);
-	return NULL;
-}
-
-static char *opt_set_fee_rates(const char *arg, struct chain_topology *topo)
-{
-	tal_free(topo->override_fee_rate);
-	topo->override_fee_rate = tal_arr(topo, u32, 3);
-
-	for (size_t i = 0; i < tal_count(topo->override_fee_rate); i++) {
-		char *endp;
-		char term;
-
-		if (i == tal_count(topo->override_fee_rate)-1)
-			term = '\0';
-		else
-			term = '/';
-		topo->override_fee_rate[i] = strtol(arg, &endp, 10);
-		if (endp == arg || *endp != term)
-			return tal_fmt(NULL,
-				       "Feerates must be <num>/<num>/<num>");
-
-		arg = endp + 1;
-	}
 	return NULL;
 }
 
@@ -299,7 +307,7 @@ static char *opt_set_offline(struct lightningd *ld)
 
 static char *opt_add_proxy_addr(const char *arg, struct lightningd *ld)
 {
-	bool needed_dns;
+	bool needed_dns = false;
 	tal_free(ld->proxyaddr);
 
 	/* We use a tal_arr here, so we can marshal it to gossipd */
@@ -314,28 +322,45 @@ static char *opt_add_proxy_addr(const char *arg, struct lightningd *ld)
 	return NULL;
 }
 
+static char *opt_set_anchor(const char *arg, u32 *u)
+{
+	if (!deprecated_apis)
+		return "--anchor-confirms is now --funding-confirms";
+
+	return opt_set_u32(arg, u);
+}
+
+static char *opt_set_locktime(const char *arg, u32 *u)
+{
+	if (!deprecated_apis)
+		return "--locktime-blocks is now --watchtime-blocks";
+
+	return opt_set_u32(arg, u);
+}
+
 static void config_register_opts(struct lightningd *ld)
 {
+	opt_register_early_arg("--conf=<file>", opt_set_talstr, NULL,
+		&ld->config_filename,
+		"Specify configuration file. Relative paths will be prefixed by lightning-dir location. (default: config)");
 	opt_register_noarg("--daemon", opt_set_bool, &ld->daemon,
 			 "Run in the background, suppress stdout/stderr");
 	opt_register_arg("--ignore-fee-limits", opt_set_bool_arg, opt_show_bool,
 			 &ld->config.ignore_fee_limits,
 			 "(DANGEROUS) allow peer to set any feerate");
-	opt_register_arg("--locktime-blocks", opt_set_u32, opt_show_u32,
+	opt_register_arg("--watchtime-blocks", opt_set_u32, opt_show_u32,
 			 &ld->config.locktime_blocks,
 			 "Blocks before peer can unilaterally spend funds");
+	opt_register_arg("--locktime-blocks", opt_set_locktime, NULL,
+			 &ld->config.locktime_blocks, opt_hidden);
 	opt_register_arg("--max-locktime-blocks", opt_set_u32, opt_show_u32,
 			 &ld->config.locktime_max,
-			 "Maximum blocks a peer can lock up our funds");
-	opt_register_arg("--anchor-onchain", opt_set_u32, opt_show_u32,
-			 &ld->config.anchor_onchain_wait,
-			 "Blocks before we give up on pending anchor transaction");
-	opt_register_arg("--anchor-confirms", opt_set_u32, opt_show_u32,
+			 "Maximum blocks funds may be locked for");
+	opt_register_arg("--funding-confirms", opt_set_u32, opt_show_u32,
 			 &ld->config.anchor_confirms,
-			 "Confirmations required for anchor transaction");
-	opt_register_arg("--max-anchor-confirms", opt_set_u32, opt_show_u32,
-			 &ld->config.anchor_confirms_max,
-			 "Maximum confirmations other side can wait for anchor transaction");
+			 "Confirmations required for funding transaction");
+	opt_register_arg("--anchor-confirms", opt_set_anchor, NULL,
+			 &ld->config.anchor_confirms, opt_hidden);
 	opt_register_arg("--commit-fee-min=<percent>", opt_set_u32, opt_show_u32,
 			 &ld->config.commitment_fee_min_percent,
 			 "Minimum percentage of fee to accept for commitment");
@@ -345,9 +370,6 @@ static void config_register_opts(struct lightningd *ld)
 	opt_register_arg("--commit-fee=<percent>", opt_set_u32, opt_show_u32,
 			 &ld->config.commitment_fee_percent,
 			 "Percentage of fee to request for their commitment");
-	opt_register_arg("--override-fee-rates", opt_set_fee_rates, NULL,
-			 ld->topology,
-			 "Force a specific rates (immediate/normal/slow) in satoshis per kw regardless of estimated fees");
 	opt_register_arg("--default-fee-rate", opt_set_u32, opt_show_u32,
 			 &ld->topology->default_fee_rate,
 			 "Satoshis per kw if can't estimate fees");
@@ -357,14 +379,9 @@ static void config_register_opts(struct lightningd *ld)
 	opt_register_arg("--cltv-final", opt_set_u32, opt_show_u32,
 			 &ld->config.cltv_final,
 			 "Number of blocks for final ctlv_expiry");
-	opt_register_arg("--max-htlc-expiry", opt_set_u32, opt_show_u32,
-			 &ld->config.max_htlc_expiry,
-			 "Maximum number of blocks to accept an HTLC before expiry");
-	opt_register_arg("--bitcoind-poll", opt_set_time, opt_show_time,
-			 &ld->config.poll_time,
-			 "Time between polling for new transactions");
-	opt_register_arg("--commit-time", opt_set_time, opt_show_time,
-			 &ld->config.commit_time,
+	opt_register_arg("--commit-time=<millseconds>",
+			 opt_set_u32, opt_show_u32,
+			 &ld->config.commit_time_ms,
 			 "Time after changes before sending out COMMIT");
 	opt_register_arg("--fee-base", opt_set_u32, opt_show_u32,
 			 &ld->config.fee_base,
@@ -406,9 +423,6 @@ static void config_register_opts(struct lightningd *ld)
 			       opt_set_bool_arg, opt_show_bool,
 			       &deprecated_apis,
 			       "Enable deprecated options, JSONRPC commands, fields, etc.");
-	opt_register_arg("--debug-subdaemon-io",
-			 opt_set_charp, NULL, &ld->debug_subdaemon_io,
-			 "Enable full peer IO logging in subdaemons ending in this string (can also send SIGUSR1 to toggle)");
 	opt_register_arg("--autocleaninvoice-cycle",
 			 opt_set_u64, opt_show_u64,
 			 &ld->ini_autocleaninvoice_cycle,
@@ -427,9 +441,44 @@ static void config_register_opts(struct lightningd *ld)
 	opt_register_early_arg("--always-use-proxy",
 			       opt_set_bool_arg, opt_show_bool,
 			       &ld->use_proxy_always, "Use the proxy always");
+
+	opt_register_noarg("--disable-dns", opt_set_invbool, &ld->config.use_dns,
+			   "Disable DNS lookups of peers");
+
+#if DEVELOPER
+	opt_register_arg("--dev-max-funding-unconfirmed-blocks",
+			 opt_set_u32, opt_show_u32,
+			 &ld->max_funding_unconfirmed,
+			 "Maximum number of blocks we wait for a channel "
+			 "funding transaction to confirm, if we are the "
+			 "fundee.");
+#endif
 }
 
 #if DEVELOPER
+static char *opt_set_fee_rates(const char *arg, struct chain_topology *topo)
+{
+	tal_free(topo->dev_override_fee_rate);
+	topo->dev_override_fee_rate = tal_arr(topo, u32, 3);
+
+	for (size_t i = 0; i < tal_count(topo->dev_override_fee_rate); i++) {
+		char *endp;
+		char term;
+
+		if (i == tal_count(topo->dev_override_fee_rate)-1)
+			term = '\0';
+		else
+			term = '/';
+		topo->dev_override_fee_rate[i] = strtol(arg, &endp, 10);
+		if (endp == arg || *endp != term)
+			return tal_fmt(NULL,
+				       "Feerates must be <num>/<num>/<num>");
+
+		arg = endp + 1;
+	}
+	return NULL;
+}
+
 static void dev_register_opts(struct lightningd *ld)
 {
 	opt_register_noarg("--dev-no-reconnect", opt_set_invbool,
@@ -447,6 +496,24 @@ static void dev_register_opts(struct lightningd *ld)
 	opt_register_noarg("--dev-allow-localhost", opt_set_bool,
 			   &ld->dev_allow_localhost,
 			   "Announce and allow announcments for localhost address");
+	opt_register_arg("--dev-bitcoind-poll", opt_set_u32, opt_show_u32,
+			 &ld->topology->poll_seconds,
+			 "Time between polling for new transactions");
+	opt_register_arg("--dev-max-fee-multiplier", opt_set_u32, opt_show_u32,
+			 &ld->config.max_fee_multiplier,
+			 "Allow the fee proposed by the remote end to be up to "
+			 "multiplier times higher than our own. Small values "
+			 "will cause channels to be closed more often due to "
+			 "fee fluctuations, large values may result in large "
+			 "fees.");
+	opt_register_arg("--dev-override-fee-rates", opt_set_fee_rates, NULL,
+			 ld->topology,
+			 "Force a specific rates (immediate/normal/slow) in satoshis per kw regardless of estimated fees");
+
+	opt_register_arg(
+	    "--dev-channel-update-interval=<s>", opt_set_u32, opt_show_u32,
+	    &ld->config.channel_update_interval,
+	    "Time in seconds between channel updates for our own channels.");
 }
 #endif
 
@@ -454,17 +521,12 @@ static const struct config testnet_config = {
 	/* 6 blocks to catch cheating attempts. */
 	.locktime_blocks = 6,
 
-	/* They can have up to 3 days. */
-	.locktime_max = 3 * 6 * 24,
-
-	/* Testnet can have long runs of empty blocks. */
-	.anchor_onchain_wait = 100,
+	/* They can have up to 14 days, maximumu value that lnd will ask for by default. */
+	/* FIXME Convince lnd to use more reasonable defaults... */
+	.locktime_max = 14 * 24 * 6,
 
 	/* We're fairly trusting, under normal circumstances. */
 	.anchor_confirms = 1,
-
-	/* More than 10 confirms seems overkill. */
-	.anchor_confirms_max = 10,
 
 	/* Testnet fees are crazy, allow infinite feerange. */
 	.commitment_fee_min_percent = 0,
@@ -475,16 +537,10 @@ static const struct config testnet_config = {
 
 	/* Be aggressive on testnet. */
 	.cltv_expiry_delta = 6,
-	.cltv_final = 6,
-
-	/* Don't lock up channel for more than 5 days. */
-	.max_htlc_expiry = 5 * 6 * 24,
-
-	/* How often to bother bitcoind. */
-	.poll_time = TIME_FROM_SEC(10),
+	.cltv_final = 10,
 
 	/* Send commit 10msec after receiving; almost immediately. */
-	.commit_time = TIME_FROM_MSEC(10),
+	.commit_time_ms = 10,
 
 	/* Allow dust payments */
 	.fee_base = 1,
@@ -492,7 +548,10 @@ static const struct config testnet_config = {
 	.fee_per_satoshi = 10,
 
 	/* BOLT #7:
-	 * Each node SHOULD flush outgoing announcements once every 60 seconds */
+	 *
+	 *   - SHOULD flush outgoing gossip messages once every 60
+	 *     seconds, independently of the arrival times of the messages.
+	 */
 	.broadcast_interval = 60000,
 
 	/* Send a keepalive update at least every week, prune every twice that */
@@ -503,6 +562,11 @@ static const struct config testnet_config = {
 
 	/* Rescan 5 hours of blocks on testnet, it's reorg happy */
 	.rescan = 30,
+
+	/* Fees may be in the range our_fee - 10*our_fee */
+	.max_fee_multiplier = 10,
+
+	.use_dns = true,
 };
 
 /* aka. "Dude, where's my coins?" */
@@ -510,17 +574,12 @@ static const struct config mainnet_config = {
 	/* ~one day to catch cheating attempts. */
 	.locktime_blocks = 6 * 24,
 
-	/* They can have up to 3 days. */
-	.locktime_max = 3 * 6 * 24,
-
-	/* You should get in within 10 blocks. */
-	.anchor_onchain_wait = 10,
+	/* They can have up to 14 days, maximumu value that lnd will ask for by default. */
+	/* FIXME Convince lnd to use more reasonable defaults... */
+	.locktime_max = 14 * 24 * 6,
 
 	/* We're fairly trusting, under normal circumstances. */
 	.anchor_confirms = 3,
-
-	/* More than 10 confirms seems overkill. */
-	.anchor_confirms_max = 10,
 
 	/* Insist between 2 and 20 times the 2-block fee. */
 	.commitment_fee_min_percent = 200,
@@ -531,24 +590,20 @@ static const struct config mainnet_config = {
 
 	/* BOLT #2:
 	 *
-	 * The `cltv_expiry_delta` for channels.  `3R+2G+2S` */
+	 * 1. the `cltv_expiry_delta` for channels, `3R+2G+2S`: if in doubt, a
+	 *   `cltv_expiry_delta` of 12 is reasonable (R=2, G=1, S=2)
+	 */
 	/* R = 2, G = 1, S = 3 */
 	.cltv_expiry_delta = 14,
 
 	/* BOLT #2:
 	 *
-	 * The minimum `cltv_expiry` we will accept for terminal payments: the
-	 * worst case for the terminal node C lower at `2R+G+S` blocks */
-	.cltv_final = 8,
-
-	/* Don't lock up channel for more than 5 days. */
-	.max_htlc_expiry = 5 * 6 * 24,
-
-	/* How often to bother bitcoind. */
-	.poll_time = TIME_FROM_SEC(30),
+	 * 4. the minimum `cltv_expiry` accepted for terminal payments: the
+	 *    worst case for the terminal node C is `2R+G+S` blocks */
+	.cltv_final = 10,
 
 	/* Send commit 10msec after receiving; almost immediately. */
-	.commit_time = TIME_FROM_MSEC(10),
+	.commit_time_ms = 10,
 
 	/* Discourage dust payments */
 	.fee_base = 1000,
@@ -556,7 +611,10 @@ static const struct config mainnet_config = {
 	.fee_per_satoshi = 10,
 
 	/* BOLT #7:
-	 * Each node SHOULD flush outgoing announcements once every 60 seconds */
+	 *
+	 *   - SHOULD flush outgoing gossip messages once every 60
+	 *     seconds, independently of the arrival times of the messages.
+	 */
 	.broadcast_interval = 60000,
 
 	/* Send a keepalive update at least every week, prune every twice that */
@@ -567,6 +625,11 @@ static const struct config mainnet_config = {
 
 	/* Rescan 2.5 hours of blocks on startup, it's not so reorg happy */
 	.rescan = 15,
+
+	/* Fees may be in the range our_fee - 10*our_fee */
+	.max_fee_multiplier = 10,
+
+	.use_dns = true,
 };
 
 static void check_config(struct lightningd *ld)
@@ -638,10 +701,14 @@ static void opt_parse_from_config(struct lightningd *ld)
 	char *argv[3];
 	int i, argc;
 
-	contents = grab_file(ld, "config");
-	/* Doesn't have to exist. */
+	if (ld->config_filename != NULL) {
+		contents = grab_file(ld, ld->config_filename);
+	} else
+		contents = grab_file(ld, "config");
+	/* The default config doesn't have to exist, but if the config was
+	 * specified on the command line it has to exist. */
 	if (!contents) {
-		if (errno != ENOENT)
+		if ((errno != ENOENT) || (ld->config_filename != NULL))
 			fatal("Opening and reading config: %s",
 			      strerror(errno));
 		/* Now we can set up defaults, since no config file. */
@@ -744,11 +811,6 @@ void register_opts(struct lightningd *ld)
 	opt_register_arg("--pid-file=<file>", opt_set_talstr, opt_show_charp,
 			 &ld->pidfile,
 			 "Specify pid file");
-
-	opt_register_arg(
-	    "--channel-update-interval=<s>", opt_set_u32, opt_show_u32,
-	    &ld->config.channel_update_interval,
-	    "Time in seconds between channel updates for our own channels.");
 
 	opt_register_logging(ld);
 	opt_register_version();
@@ -917,7 +979,9 @@ static void add_config(struct lightningd *ld,
 			abort();
 		}
 	} else if (opt->type & OPT_HASARG) {
-		if (opt->show) {
+		if (opt->desc == opt_hidden) {
+			/* Ignore hidden options (deprecated) */
+		} else if (opt->show) {
 			char *buf = tal_arr(name0, char, OPT_SHOW_LEN+1);
 			opt->show(buf, opt->u.carg);
 
@@ -948,13 +1012,6 @@ static void add_config(struct lightningd *ld,
 			answer = (const char *)ld->alias;
 		} else if (opt->cb_arg == (void *)arg_log_to_file) {
 			answer = ld->logfile;
-		} else if (opt->cb_arg == (void *)opt_set_fee_rates) {
-			struct chain_topology *topo = ld->topology;
-			if (topo->override_fee_rate)
-				answer = tal_fmt(name0, "%u/%u/%u",
-						 topo->override_fee_rate[0],
-						 topo->override_fee_rate[1],
-						 topo->override_fee_rate[2]);
 		} else if (opt->cb_arg == (void *)opt_set_port) {
 			if (!deprecated_apis)
 				answer = tal_fmt(name0, "%u", ld->portnum);
@@ -1003,12 +1060,13 @@ static void json_listconfigs(struct command *cmd,
 {
 	size_t i;
 	struct json_result *response = new_json_result(cmd);
-	jsmntok_t *configtok;
+	const jsmntok_t *configtok;
 	bool found = false;
 
-	if (!json_get_params(cmd, buffer, params, "?config", &configtok, NULL)) {
+	if (!param(cmd, buffer, params,
+		   p_opt_tok("config", &configtok),
+		   NULL))
 		return;
-	}
 
 	json_object_start(response, NULL);
 	if (!configtok)
@@ -1043,7 +1101,8 @@ static void json_listconfigs(struct command *cmd,
 	json_object_end(response);
 
 	if (configtok && !found) {
-		command_fail(cmd, "Unknown config option '%.*s'",
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Unknown config option '%.*s'",
 			     configtok->end - configtok->start,
 			     buffer + configtok->start);
 		return;

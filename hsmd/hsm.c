@@ -41,6 +41,8 @@
 #include <wire/gen_peer_wire.h>
 #include <wire/wire_io.h>
 
+#define REQ_FD 3
+
 /* Nobody will ever find it here! */
 static struct {
 	struct secret hsm_secret;
@@ -52,6 +54,7 @@ struct client {
 	struct daemon_conn *master;
 
 	struct pubkey id;
+	u64 dbid;
 	struct io_plan *(*handle)(struct io_conn *, struct daemon_conn *);
 
 	/* What is this client allowed to ask for? */
@@ -90,6 +93,7 @@ static void node_key(struct privkey *node_privkey, struct pubkey *node_id)
 
 static struct client *new_client(struct daemon_conn *master,
 				 const struct pubkey *id,
+				 u64 dbid,
 				 const u64 capabilities,
 				 struct io_plan *(*handle)(struct io_conn *,
 							   struct daemon_conn *),
@@ -102,6 +106,7 @@ static struct client *new_client(struct daemon_conn *master,
 	} else {
 		memset(&c->id, 0, sizeof(c->id));
 	}
+	c->dbid = dbid;
 
 	c->handle = handle;
 	c->master = master;
@@ -113,6 +118,37 @@ static struct client *new_client(struct daemon_conn *master,
 	/* Free client when connection freed. */
 	tal_steal(c->dc.conn, c);
 	return c;
+}
+
+/**
+ * hsm_peer_secret_base -- Derive the base secret seed for per-peer seeds
+ *
+ * This secret is shared by all channels/peers for the client. The
+ * per-peer seeds will be generated from it by mixing in the
+ * channel_id and the peer node_id.
+ */
+static void hsm_peer_secret_base(struct secret *peer_seed_base)
+{
+	hkdf_sha256(peer_seed_base, sizeof(struct secret), NULL, 0,
+		    &secretstuff.hsm_secret, sizeof(secretstuff.hsm_secret),
+		    "peer seed", strlen("peer seed"));
+}
+
+static void get_channel_seed(const struct pubkey *peer_id, u64 dbid,
+			     struct secret *channel_seed)
+{
+	struct secret peer_base;
+	u8 input[PUBKEY_DER_LEN + sizeof(dbid)];
+	const char *info = "per-peer seed";
+
+	hsm_peer_secret_base(&peer_base);
+	pubkey_to_der(input, peer_id);
+	memcpy(input + PUBKEY_DER_LEN, &dbid, sizeof(dbid));
+
+	hkdf_sha256(channel_seed, sizeof(*channel_seed),
+		    input, sizeof(input),
+		    &peer_base, sizeof(peer_base),
+		    info, strlen(info));
 }
 
 static struct io_plan *handle_ecdh(struct io_conn *conn, struct daemon_conn *dc)
@@ -147,19 +183,25 @@ static struct io_plan *handle_ecdh(struct io_conn *conn, struct daemon_conn *dc)
 }
 
 static struct io_plan *handle_cannouncement_sig(struct io_conn *conn,
-						struct daemon_conn *dc)
+						struct client *c)
 {
+	struct daemon_conn *dc = &c->dc;
 	/* First 2 + 256 byte are the signatures and msg type, skip them */
 	size_t offset = 258;
 	struct privkey node_pkey;
-	secp256k1_ecdsa_signature node_sig;
+	secp256k1_ecdsa_signature node_sig, bitcoin_sig;
 	struct sha256_double hash;
 	u8 *reply;
 	u8 *ca;
-	struct pubkey bitcoin_id;
+	struct pubkey funding_pubkey;
+	struct privkey funding_privkey;
+	struct secret channel_seed;
 
-	if (!fromwire_hsm_cannouncement_sig_req(tmpctx, dc->msg_in,
-						&bitcoin_id, &ca)) {
+	/* FIXME: We should cache these. */
+	get_channel_seed(&c->id, c->dbid, &channel_seed);
+	derive_funding_key(&channel_seed, &funding_pubkey, &funding_privkey);
+
+	if (!fromwire_hsm_cannouncement_sig_req(tmpctx, dc->msg_in, &ca)) {
 		status_broken("Failed to parse cannouncement_sig_req: %s",
 			      tal_hex(tmpctx, dc->msg_in));
 		return io_close(conn);
@@ -176,8 +218,10 @@ static struct io_plan *handle_cannouncement_sig(struct io_conn *conn,
 	sha256_double(&hash, ca + offset, tal_len(ca) - offset);
 
 	sign_hash(&node_pkey, &hash, &node_sig);
+	sign_hash(&funding_privkey, &hash, &bitcoin_sig);
 
-	reply = towire_hsm_cannouncement_sig_reply(NULL, &node_sig);
+	reply = towire_hsm_cannouncement_sig_reply(NULL, &node_sig,
+						   &bitcoin_sig);
 	daemon_conn_send(dc, take(reply));
 
 	return daemon_conn_read_next(conn, dc);
@@ -300,7 +344,7 @@ static struct io_plan *handle_client(struct io_conn *conn,
 		return handle_ecdh(conn, dc);
 
 	case WIRE_HSM_CANNOUNCEMENT_SIG_REQ:
-		return handle_cannouncement_sig(conn, dc);
+		return handle_cannouncement_sig(conn, c);
 
 	case WIRE_HSM_CUPDATE_SIG_REQ:
 		return handle_channel_update_sig(conn, dc);
@@ -339,20 +383,6 @@ static struct io_plan *handle_client(struct io_conn *conn,
 								  &c->id,
 								  dc->msg_in)));
 	return io_close(conn);
-}
-
-/**
- * hsm_peer_secret_base -- Derive the base secret seed for per-peer seeds
- *
- * This secret is shared by all channels/peers for the client. The
- * per-peer seeds will be generated from it by mixing in the
- * channel_id and the peer node_id.
- */
-static void hsm_peer_secret_base(struct secret *peer_seed_base)
-{
-	hkdf_sha256(peer_seed_base, sizeof(struct secret), NULL, 0,
-		    &secretstuff.hsm_secret, sizeof(secretstuff.hsm_secret),
-		    "peer seed", strlen("peer seed"));
 }
 
 static void send_init_response(struct daemon_conn *master)
@@ -529,23 +559,23 @@ static void init_hsm(struct daemon_conn *master, const u8 *msg)
 static void pass_client_hsmfd(struct daemon_conn *master, const u8 *msg)
 {
 	int fds[2];
-	u64 capabilities;
+	u64 dbid, capabilities;
 	struct pubkey id;
 
-	if (!fromwire_hsm_client_hsmfd(msg, &id, &capabilities))
+	if (!fromwire_hsm_client_hsmfd(msg, &id, &dbid, &capabilities))
 		master_badmsg(WIRE_HSM_CLIENT_HSMFD, msg);
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR, "creating fds: %s", strerror(errno));
 
-	new_client(master, &id, capabilities, handle_client, fds[0]);
+	new_client(master, &id, dbid, capabilities, handle_client, fds[0]);
 	daemon_conn_send(master,
 			 take(towire_hsm_client_hsmfd_reply(NULL)));
 	daemon_conn_send_fd(master, fds[1]);
 }
 
 
-static void derive_peer_seed(struct privkey *peer_seed, struct privkey *peer_seed_base,
+static void derive_peer_seed(struct secret *peer_seed, struct secret *peer_seed_base,
 		      const struct pubkey *peer_id, const u64 channel_id)
 {
 	u8 input[PUBKEY_DER_LEN + sizeof(channel_id)];
@@ -562,10 +592,10 @@ static void derive_peer_seed(struct privkey *peer_seed, struct privkey *peer_see
 static void hsm_unilateral_close_privkey(struct privkey *dst,
 					 struct unilateral_close_info *info)
 {
-	struct privkey peer_seed, peer_seed_base;
+	struct secret peer_seed, peer_seed_base;
 	struct basepoints basepoints;
 	struct secrets secrets;
-	hsm_peer_secret_base(&peer_seed_base.secret);
+	hsm_peer_secret_base(&peer_seed_base);
 	derive_peer_seed(&peer_seed, &peer_seed_base, &info->peer_id, info->channel_id);
 	derive_basepoints(&peer_seed, NULL, &basepoints, &secrets, NULL);
 
@@ -828,14 +858,13 @@ int main(int argc, char *argv[])
 	struct client *client;
 
 	subdaemon_setup(argc, argv);
+	status_setup_sync(STDIN_FILENO);
 
-	client = new_client(NULL, NULL, HSM_CAP_MASTER | HSM_CAP_SIGN_GOSSIP, handle_client, STDIN_FILENO);
+	client = new_client(NULL, NULL, 0, HSM_CAP_MASTER | HSM_CAP_SIGN_GOSSIP, handle_client, REQ_FD);
 
 	/* We're our own master! */
 	client->master = &client->dc;
 	io_set_finish(client->dc.conn, master_gone, &client->dc);
-
-	status_setup_async(&client->dc);
 
 	/* When conn closes, everything is freed. */
 	tal_steal(client->dc.conn, client);

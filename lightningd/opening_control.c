@@ -15,9 +15,11 @@
 #include <lightningd/hsm_control.h>
 #include <lightningd/json.h>
 #include <lightningd/jsonrpc.h>
+#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
 #include <lightningd/opening_control.h>
+#include <lightningd/param.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
 #include <openingd/gen_opening_wire.h>
@@ -45,11 +47,11 @@ struct uncommitted_channel {
 	struct funding_channel *fc;
 
 	/* Secret seed (FIXME: Move to hsm!) */
-	struct privkey seed;
+	struct secret seed;
 
 	/* Blockheight at creation, scans for funding confirmations
 	 * will start here */
-	u64 first_blocknum;
+	u32 first_blocknum;
 
 	/* These are *not* filled in by new_uncommitted_channel: */
 
@@ -113,7 +115,7 @@ static void uncommitted_channel_to_gossipd(struct lightningd *ld,
 
 	log_unusual(uc->log, "Opening channel: %s", errstr);
 	if (uc->fc)
-		command_fail(uc->fc->cmd, "%s", errstr);
+		command_fail(uc->fc->cmd, LIGHTNINGD, "%s", errstr);
 
 	/* Hand back to gossipd, (maybe) with an error packet to send. */
 	msg = towire_gossipctl_hand_back_peer(errstr, &uc->peer->id, cs,
@@ -133,7 +135,7 @@ void kill_uncommitted_channel(struct uncommitted_channel *uc,
 	uc->openingd = NULL;
 
 	if (uc->fc)
-		command_fail(uc->fc->cmd, "%s", why);
+		command_fail(uc->fc->cmd, LIGHTNINGD, "%s", why);
 	tal_free(uc);
 }
 
@@ -305,7 +307,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 		log_broken(fc->uc->log,
 			   "bad OPENING_FUNDER_REPLY %s",
 			   tal_hex(resp, resp));
-		command_fail(fc->cmd, "bad OPENING_FUNDER_REPLY %s",
+		command_fail(fc->cmd, LIGHTNINGD, "bad OPENING_FUNDER_REPLY %s",
 			     tal_hex(fc->cmd, resp));
 		goto failed;
 	}
@@ -342,7 +344,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 
 	bitcoin_txid(fundingtx, &funding_txid);
 
-	if (!structeq(&funding_txid, &expected_txid)) {
+	if (!bitcoin_txid_eq(&funding_txid, &expected_txid)) {
 		log_broken(fc->uc->log,
 			   "Funding txid mismatch:"
 			   " satoshi %"PRIu64" change %"PRIu64
@@ -354,7 +356,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					  &local_fundingkey),
 			   type_to_string(fc, struct pubkey,
 					  &channel_info.remote_fundingkey));
-		command_fail(fc->cmd,
+		command_fail(fc->cmd, JSONRPC2_INVALID_PARAMS,
 			     "Funding txid mismatch:"
 			     " satoshi %"PRIu64" change %"PRIu64
 			     " changeidx %u"
@@ -380,7 +382,8 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					&channel_info,
 					feerate);
 	if (!channel) {
-		command_fail(fc->cmd, "Key generation failure");
+		command_fail(fc->cmd, LIGHTNINGD,
+			     "Key generation failure");
 		goto failed;
 	}
 
@@ -396,7 +399,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	if (!wire_sync_write(ld->hsm_fd, take(msg)))
 		fatal("Could not write to HSM: %s", strerror(errno));
 
-	msg = hsm_sync_read(fc, ld);
+	msg = wire_sync_read(fc, ld->hsm_fd);
 	if (!fromwire_hsm_sign_funding_reply(tmpctx, msg, &fundingtx))
 		fatal("HSM gave bad sign_funding_reply %s",
 		      tal_hex(msg, resp));
@@ -542,7 +545,7 @@ static void opening_channel_errmsg(struct uncommitted_channel *uc,
 		log_info(uc->log, "%s", desc);
 		subd_send_msg(uc->peer->ld->gossip, msg);
 		if (uc->fc)
-			command_fail(uc->fc->cmd, "%s", desc);
+			command_fail(uc->fc->cmd, LIGHTNINGD, "%s", desc);
 	} else {
 		/* An error occurred (presumably negotiation fail). */
 		const char *errsrc = err_for_them ? "sent" : "received";
@@ -624,20 +627,19 @@ new_uncommitted_channel(struct lightningd *ld,
 static void channel_config(struct lightningd *ld,
 			   struct channel_config *ours,
 			   u32 *max_to_self_delay,
-			   u32 *max_minimum_depth,
 			   u64 *min_effective_htlc_capacity_msat)
 {
 	/* FIXME: depend on feerate. */
 	*max_to_self_delay = ld->config.locktime_max;
-	*max_minimum_depth = ld->config.anchor_confirms_max;
 	/* This is 1c at $1000/BTC */
 	*min_effective_htlc_capacity_msat = 1000000;
 
 	/* BOLT #2:
 	 *
-	 * The sender SHOULD set `dust_limit_satoshis` to a sufficient
-	 * value to allow commitment transactions to propagate through
-	 * the Bitcoin network.
+	 * The sending node SHOULD:
+	 *...
+	 *   - set `dust_limit_satoshis` to a sufficient value to allow
+	 *     commitment transactions to propagate through the Bitcoin network.
 	 */
 	ours->dust_limit_satoshis = 546;
 	ours->max_htlc_value_in_flight_msat = UINT64_MAX;
@@ -647,16 +649,18 @@ static void channel_config(struct lightningd *ld,
 
 	/* BOLT #2:
 	 *
-	 * The sender SHOULD set `to_self_delay` sufficient to ensure
-	 * the sender can irreversibly spend a commitment transaction
-	 * output in case of misbehavior by the receiver.
+	 * The sending node SHOULD:
+	 *   - set `to_self_delay` sufficient to ensure the sender can
+	 *     irreversibly spend a commitment transaction output, in case of
+	 *     misbehavior by the receiver.
 	 */
 	 ours->to_self_delay = ld->config.locktime_blocks;
 
 	 /* BOLT #2:
 	  *
-	  * It MUST fail the channel if `max_accepted_htlcs` is greater than
-	  * 483.
+	  * The receiving node MUST fail the channel if:
+	  *...
+	  *   - `max_accepted_htlcs` is greater than 483.
 	  */
 	 ours->max_accepted_htlcs = 483;
 
@@ -678,7 +682,7 @@ u8 *peer_accept_channel(const tal_t *ctx,
 			const struct channel_id *channel_id,
 			const u8 *open_msg)
 {
-	u32 max_to_self_delay, max_minimum_depth;
+	u32 max_to_self_delay;
 	u64 min_effective_htlc_capacity_msat;
 	u8 *msg;
 	struct uncommitted_channel *uc;
@@ -716,14 +720,14 @@ u8 *peer_accept_channel(const tal_t *ctx,
 
 	/* BOLT #2:
 	 *
-	 * The sender SHOULD set `minimum_depth` to a number of blocks it
-	 * considers reasonable to avoid double-spending of the funding
-	 * transaction.
+	 * The sender:
+	 *   - SHOULD set `minimum_depth` to a number of blocks it considers
+	 *     reasonable to avoid double-spending of the funding transaction.
 	 */
 	uc->minimum_depth = ld->config.anchor_confirms;
 
 	channel_config(ld, &uc->our_config,
-		       &max_to_self_delay, &max_minimum_depth,
+		       &max_to_self_delay,
 		       &min_effective_htlc_capacity_msat);
 
 	msg = towire_opening_init(uc, get_chainparams(ld)->index,
@@ -751,7 +755,7 @@ static void peer_offer_channel(struct lightningd *ld,
 			       int peer_fd, int gossip_fd)
 {
 	u8 *msg;
-	u32 max_to_self_delay, max_minimum_depth;
+	u32 max_to_self_delay;
 	u64 min_effective_htlc_capacity_msat;
 
 	/* Remove from list, it's not pending any more. */
@@ -763,7 +767,7 @@ static void peer_offer_channel(struct lightningd *ld,
 	/* We asked to release this peer, but another raced in?  Corner case,
 	 * close this is easiest. */
 	if (!fc->uc) {
-		command_fail(fc->cmd, "Peer already active");
+		command_fail(fc->cmd, LIGHTNINGD, "Peer already active");
 		close(peer_fd);
 		close(gossip_fd);
 		return;
@@ -793,7 +797,7 @@ static void peer_offer_channel(struct lightningd *ld,
 	}
 
 	channel_config(ld, &fc->uc->our_config,
-		       &max_to_self_delay, &max_minimum_depth,
+		       &max_to_self_delay,
 		       &min_effective_htlc_capacity_msat);
 
 	msg = towire_opening_init(fc,
@@ -807,7 +811,6 @@ static void peer_offer_channel(struct lightningd *ld,
 	msg = towire_opening_funder(fc, fc->wtx.amount,
 				    fc->push_msat,
 				    get_feerate(ld->topology, FEERATE_NORMAL),
-				    max_minimum_depth,
 				    fc->wtx.change, fc->wtx.change_key_index,
 				    fc->channel_flags,
 				    fc->wtx.utxos,
@@ -843,12 +846,12 @@ static void gossip_peer_released(struct subd *gossip,
 			      tal_hex(gossip, resp));
 		}
 		if (uc)
-			command_fail(fc->cmd, "Peer already OPENING");
+			command_fail(fc->cmd, LIGHTNINGD, "Peer already OPENING");
 		else if (c)
-			command_fail(fc->cmd, "Peer already %s",
+			command_fail(fc->cmd, LIGHTNINGD, "Peer already %s",
 				     channel_state_name(c));
 		else
-			command_fail(fc->cmd, "Peer not connected");
+			command_fail(fc->cmd, LIGHTNINGD, "Peer not connected");
 		return;
 	}
 	assert(tal_count(fds) == 2);
@@ -890,7 +893,7 @@ bool handle_opening_channel(struct lightningd *ld,
 static void json_fund_channel(struct command *cmd,
 			      const char *buffer, const jsmntok_t *params)
 {
-	jsmntok_t *desttok, *sattok;
+	const jsmntok_t *desttok, *sattok;
 	struct funding_channel * fc = tal(cmd, struct funding_channel);
 	u32 feerate_per_kw = get_feerate(cmd->ld->topology, FEERATE_NORMAL);
 	u8 *msg;
@@ -898,16 +901,18 @@ static void json_fund_channel(struct command *cmd,
 	fc->cmd = cmd;
 	fc->uc = NULL;
 	wtx_init(cmd, &fc->wtx);
-	if (!json_get_params(fc->cmd, buffer, params,
-			     "id", &desttok,
-			     "satoshi", &sattok, NULL))
+	if (!param(fc->cmd, buffer, params,
+		   p_req("id", json_tok_tok, &desttok),
+		   p_req("satoshi", json_tok_tok, &sattok),
+		   NULL))
 		return;
+
 	if (!json_tok_wtx(&fc->wtx, buffer, sattok))
 		return;
 	if (!pubkey_from_hexstr(buffer + desttok->start,
 				desttok->end - desttok->start,
 				&fc->peerid)) {
-		command_fail(cmd, "Could not parse id");
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS, "Could not parse id");
 		return;
 	}
 
@@ -920,7 +925,8 @@ static void json_fund_channel(struct command *cmd,
 		return;
 
 	if (fc->wtx.amount > MAX_FUNDING_SATOSHI) {
-		command_fail(cmd, "Funding satoshi must be <= %d",
+		command_fail(cmd, FUND_MAX_EXCEEDED,
+			     "Funding satoshi must be <= %d",
 			     MAX_FUNDING_SATOSHI);
 		return;
 	}

@@ -120,7 +120,7 @@ static void negotiate_auth(struct rbuf *rbuf, const char *tor_password)
 {
 	char *line;
 	char *cookiefile = NULL;
-	int cookiefileerrno;
+	int cookiefileerrno = 0;
 
 	tor_send_cmd(rbuf, "PROTOCOLINFO 1");
 
@@ -161,6 +161,7 @@ static void negotiate_auth(struct rbuf *rbuf, const char *tor_password)
 				cookiefileerrno = errno;
 				continue;
 			}
+			assert(tal_len(contents) != 0);
 			discard_remaining_response(rbuf);
 			tor_send_cmd(rbuf,
 				     tal_fmt(tmpctx, "AUTHENTICATE %s",

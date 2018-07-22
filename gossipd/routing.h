@@ -6,20 +6,10 @@
 #include <ccan/htable/htable_type.h>
 #include <ccan/time/time.h>
 #include <gossipd/broadcast.h>
+#include <gossipd/gossip_constants.h>
 #include <gossipd/gossip_store.h>
 #include <wire/gen_onion_wire.h>
 #include <wire/wire.h>
-
-#define ROUTING_MAX_HOPS 20
-/* BOLT #7:
- *
- * The `flags` bitfield...individual bits:
- *...
- * | 0             | `direction` | Direction this update refers to. |
- * | 1             | `disable`   | Disable the channel.             |
- */
-#define ROUTING_FLAGS_DIRECTION (1 << 0)
-#define ROUTING_FLAGS_DISABLED  (1 << 1)
 
 struct half_chan {
 	/* Cached `channel_update` which initialized below (or NULL) */
@@ -62,6 +52,8 @@ struct chan {
 
 	/* NULL if not announced yet (ie. not public). */
 	const u8 *channel_announce;
+	/* Index in broadcast map, if public (otherwise 0) */
+	u64 channel_announcement_index;
 
 	u64 satoshis;
 };
@@ -109,13 +101,18 @@ struct node {
 	/* Color to be used when displaying the name */
 	u8 rgb_color[3];
 
+	/* (Global) features */
+	u8 *gfeatures;
+
 	/* Cached `node_announcement` we might forward to new peers (or NULL). */
 	const u8 *node_announcement;
+	/* If public, this is non-zero. */
+	u64 node_announcement_index;
 };
 
-const secp256k1_pubkey *node_map_keyof_node(const struct node *n);
-size_t node_map_hash_key(const secp256k1_pubkey *key);
-bool node_map_node_eq(const struct node *n, const secp256k1_pubkey *key);
+const struct pubkey *node_map_keyof_node(const struct node *n);
+size_t node_map_hash_key(const struct pubkey *key);
+bool node_map_node_eq(const struct node *n, const struct pubkey *key);
 HTABLE_DEFINE_TYPE(struct node, node_map_keyof_node, node_map_hash_key, node_map_node_eq, node_map);
 
 struct pending_node_map;
@@ -185,6 +182,9 @@ struct routing_state {
 
         /* A map of channels indexed by short_channel_ids */
 	UINTMAP(struct chan *) chanmap;
+
+	/* Has one of our own channels been announced? */
+	bool local_channel_announced;
 };
 
 static inline struct chan *
@@ -227,19 +227,15 @@ u8 *handle_channel_announcement(struct routing_state *rstate,
 /**
  * handle_pending_cannouncement -- handle channel_announce once we've
  * completed short_channel_id lookup.
- *
- * Returns true if the channel was new and is local. This means that
- * if we haven't sent a node_announcement just yet, now would be a
- * good time.
  */
-bool handle_pending_cannouncement(struct routing_state *rstate,
+void handle_pending_cannouncement(struct routing_state *rstate,
 				  const struct short_channel_id *scid,
 				  const u64 satoshis,
 				  const u8 *txscript);
 
 /* Returns NULL if all OK, otherwise an error for the peer which sent. */
 u8 *handle_channel_update(struct routing_state *rstate, const u8 *update,
-			  bool add_to_store);
+			  const char *source);
 
 /* Returns NULL if all OK, otherwise an error for the peer which sent. */
 u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node);

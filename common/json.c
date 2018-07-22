@@ -76,6 +76,21 @@ bool json_tok_double(const char *buffer, const jsmntok_t *tok, double *num)
 	return true;
 }
 
+bool json_tok_percent(const char *buffer, const jsmntok_t *tok, double *num)
+{
+	if (!json_tok_double(buffer, tok, num))
+		return false;
+
+	/* Ensure it is in the range [0.0, 100.0] */
+	if (!(0.0 <= *num))
+		return false;
+
+	if (!(*num <= 100.0))
+		return false;
+
+	return true;
+}
+
 bool json_tok_number(const char *buffer, const jsmntok_t *tok,
 		     unsigned int *num)
 {
@@ -141,6 +156,13 @@ bool json_tok_bool(const char *buffer, const jsmntok_t *tok, bool *b)
 		return true;
 	}
 	return false;
+}
+
+bool json_tok_tok(const char *buffer, const jsmntok_t * tok,
+		  const jsmntok_t **out)
+{
+	*out = tok;
+	return true;
 }
 
 const jsmntok_t *json_next(const jsmntok_t *tok)

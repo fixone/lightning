@@ -1,6 +1,5 @@
 /* FIXME: We don't relay from gossipd at all here. */
 #include <bitcoin/script.h>
-#include <ccan/structeq/structeq.h>
 #include <closingd/gen_closing_wire.h>
 #include <common/close_tx.h>
 #include <common/crypto_sync.h>
@@ -89,14 +88,20 @@ static void do_reconnect(struct crypto_state *cs,
 
 	/* BOLT #2:
 	 *
-	 * On reconnection, a node MUST transmit `channel_reestablish` for
-	 * each channel, and MUST wait for to receive the other node's
-	 * `channel_reestablish` message before sending any other messages for
-	 * that channel.  The sending node MUST set
-	 * `next_local_commitment_number` to the commitment number of the next
-	 * `commitment_signed` it expects to receive, and MUST set
-	 * `next_remote_revocation_number` to the commitment number of the
-	 * next `revoke_and_ack` message it expects to receive.
+	 *   - upon reconnection:
+	 *     - if a channel is in an error state:
+	 *       - SHOULD retransmit the error packet and ignore any other packets for
+	 *        that channel.
+	 *     - otherwise:
+	 *       - MUST transmit `channel_reestablish` for each channel.
+	 *       - MUST wait to receive the other node's `channel_reestablish`
+	 *         message before sending any other messages for that channel.
+	 *
+	 * The sending node:
+	 *   - MUST set `next_local_commitment_number` to the commitment number
+	 *     of the next `commitment_signed` it expects to receive.
+	 *   - MUST set `next_remote_revocation_number` to the commitment number
+	 *     of the next `revoke_and_ack` message it expects to receive.
 	 */
 	msg = towire_channel_reestablish(NULL, channel_id,
 					 next_index[LOCAL],
@@ -112,7 +117,6 @@ static void do_reconnect(struct crypto_state *cs,
 		channel_reestablish
 			= read_peer_msg(tmpctx, cs, channel_id,
 					sync_crypto_write_arg,
-					status_fail_io,
 					NULL);
 	}
 
@@ -130,16 +134,6 @@ static void do_reconnect(struct crypto_state *cs,
 
 	/* FIXME: Spec says to re-xmit funding_locked here if we haven't
 	 * done any updates. */
-
-	/* BOLT #2:
-	 *
-	 * On reconnection if the node has sent a previous `closing_signed` it
-	 * MUST send another `closing_signed`
-	 */
-
-	/* Since we always transmit closing_signed immediately, if
-	 * we're reconnecting we consider ourselves to have transmitted once,
-	 * and we'll immediately do the retransmit now anyway. */
 }
 
 static void send_offer(struct crypto_state *cs,
@@ -162,9 +156,9 @@ static void send_offer(struct crypto_state *cs,
 
 	/* BOLT #2:
 	 *
-	 * The sender MUST set `signature` to the Bitcoin signature of
-	 * the close transaction as specified in [BOLT
-	 * #3](03-transactions.md#closing-transaction).
+	 *   - MUST set `signature` to the Bitcoin signature of the close
+	 *     transaction, as specified in [BOLT
+	 *     #3](03-transactions.md#closing-transaction).
 	 */
 	tx = close_tx(tmpctx, cs, channel_id,
 		      scriptpubkey,
@@ -178,7 +172,7 @@ static void send_offer(struct crypto_state *cs,
 	 *
 	 * ## Closing Transaction
 	 *...
-	 * Each node offering a signature... MAY also eliminate its
+	 * Each node offering a signature... MAY eliminate its
 	 * own output.
 	 */
 	/* (We don't do this). */
@@ -236,22 +230,20 @@ static uint64_t receive_offer(struct crypto_state *cs,
 
 		msg = read_peer_msg(tmpctx, cs, channel_id,
 				    sync_crypto_write_arg,
-				    status_fail_io,
 				    NULL);
 
 		/* BOLT #2:
 		 *
-		 * On reconnection, a node MUST ignore a redundant
-		 * `funding_locked` if it receives one.
+		 *  - upon reconnection:
+		 *     - MUST ignore any redundant `funding_locked` it receives.
 		 */
 		/* This should only happen if we've made no commitments, but
 		 * we don't have to check that: it's their problem. */
 		if (msg && fromwire_peektype(msg) == WIRE_FUNDING_LOCKED)
 			msg = tal_free(msg);
 		/* BOLT #2:
-		 *
-		 * ...if the node has sent a previous `shutdown` it MUST
-		 * retransmit it.
+		 *     - if it has sent a previous `shutdown`:
+		 *       - MUST retransmit `shutdown`.
 		 */
 		else if (msg && fromwire_peektype(msg) == WIRE_SHUTDOWN)
 			msg = tal_free(msg);
@@ -265,10 +257,10 @@ static uint64_t receive_offer(struct crypto_state *cs,
 
 	/* BOLT #2:
 	 *
-	 * The receiver MUST check `signature` is valid for either
-	 * variant of close transaction specified in [BOLT
-	 * #3](03-transactions.md#closing-transaction), and MUST fail
-	 * the connection if it is not.
+	 * The receiving node:
+	 *   - if the `signature` is not valid for either variant of close
+	 *     transaction specified in [BOLT #3](03-transactions.md#closing-transaction):
+	 *     - MUST fail the connection.
 	 */
 	tx = close_tx(tmpctx, cs, channel_id,
 		      scriptpubkey,
@@ -291,10 +283,13 @@ static uint64_t receive_offer(struct crypto_state *cs,
 
 		/* BOLT #3:
 		 *
-		 * Each node offering a signature MUST subtract the fee given
-		 * by `fee_satoshis` from the output to the funder; it MUST
-		 * then remove any output below its own `dust_limit_satoshis`,
-		 * and MAY also eliminate its own output.
+		 * Each node offering a signature:
+		 *   - MUST round each output down to whole satoshis.
+		 *   - MUST subtract the fee given by `fee_satoshis` from the
+		 *     output to the funder.
+		 *   - MUST remove any output below its own
+		 *    `dust_limit_satoshis`.
+		 *   - MAY eliminate its own output.
 		 */
 		trimmed = close_tx(tmpctx, cs, channel_id,
 				   scriptpubkey,
@@ -383,8 +378,8 @@ static void adjust_feerange(struct crypto_state *cs,
 
 	/* BOLT #2:
 	 *
-	 * ...otherwise it MUST propose a value strictly between the received
-	 * `fee_satoshis` and its previously-sent `fee_satoshis`.
+	 *     - MUST propose a value "strictly between" the received
+	 *      `fee_satoshis` and its previously-sent `fee_satoshis`.
 	 */
 	if (side == feerange->higher_side)
 		feerange->max = offer - 1;
@@ -429,7 +424,7 @@ int main(int argc, char *argv[])
 	struct crypto_state cs;
 	const tal_t *ctx = tal(NULL, char);
 	u8 *msg;
-	struct privkey seed;
+	struct secret seed;
 	struct pubkey funding_pubkey[NUM_SIDES];
 	struct bitcoin_txid funding_txid;
 	u16 funding_txout;

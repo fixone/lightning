@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
+#include <lightningd/channel_control.h>
 #include <lightningd/invoice.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/log.h>
@@ -78,8 +79,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->reconnect = true;
 	timers_init(&ld->timers, time_mono());
 	ld->topology = new_topology(ld, ld->log);
-	ld->debug_subdaemon_io = NULL;
 	ld->daemon = false;
+	ld->config_filename = NULL;
 	ld->pidfile = NULL;
 	ld->ini_autocleaninvoice_cycle = 0;
 	ld->ini_autocleaninvoice_expiredby = 86400;
@@ -87,6 +88,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->use_proxy_always = false;
 	ld->pure_tor_setup = false;
 	ld->tor_service_password = NULL;
+	ld->max_funding_unconfirmed = 2016;
+
 	return ld;
 }
 
@@ -204,6 +207,7 @@ static void shutdown_subdaemons(struct lightningd *ld)
 	/* Let everyone shutdown cleanly. */
 	close(ld->hsm_fd);
 	subd_shutdown(ld->gossip, 10);
+	subd_shutdown(ld->hsm, 10);
 
 	free_htlcs(ld, NULL);
 
@@ -293,10 +297,18 @@ static int io_poll_lightningd(struct pollfd *fds, nfds_t nfds, int timeout)
 	return io_poll_debug(fds, nfds, timeout);
 }
 
+void notify_new_block(struct lightningd *ld,
+		      u32 block_height)
+{
+	/* Inform our subcomponents individually. */
+	htlcs_notify_new_block(ld, block_height);
+	channel_notify_new_block(ld, block_height);
+}
+
 int main(int argc, char *argv[])
 {
 	struct lightningd *ld;
-	u32 blockheight;
+	u32 min_blockheight, max_blockheight;
 
 	setup_locale();
 	daemon_setup(argv[0], log_backtrace_print, log_backtrace_exit);
@@ -378,25 +390,22 @@ int main(int argc, char *argv[])
 	/* Get the blockheight we are currently at, UINT32_MAX is used to signal
 	 * an unitialized wallet and that we should start off of bitcoind's
 	 * current height */
-	blockheight = wallet_blocks_height(ld->wallet, UINT32_MAX);
+	wallet_blocks_heights(ld->wallet, UINT32_MAX, &min_blockheight, &max_blockheight);
 
 	/* If we were asked to rescan from an absolute height (--rescan < 0)
-	 * then just go there. Otherwise take compute the diff to our current
-	 * height, lowerbounded by 0. */
+	 * then just go there. Otherwise compute the diff to our current height,
+	 * lowerbounded by 0. */
 	if (ld->config.rescan < 0)
-		blockheight = -ld->config.rescan;
-	else if (blockheight < (u32)ld->config.rescan)
-		blockheight = 0;
-	else if (blockheight != UINT32_MAX)
-		blockheight -= ld->config.rescan;
+		max_blockheight = -ld->config.rescan;
+	else if (max_blockheight < (u32)ld->config.rescan)
+		max_blockheight = 0;
+	else if (max_blockheight != UINT32_MAX)
+		max_blockheight -= ld->config.rescan;
 
 	db_commit_transaction(ld->wallet->db);
 
 	/* Initialize block topology (does its own transaction) */
-	setup_topology(ld->topology,
-		       &ld->timers,
-		       ld->config.poll_time,
-		       blockheight);
+	setup_topology(ld->topology, &ld->timers, min_blockheight, max_blockheight);
 
 	/* Create RPC socket (if any) */
 	setup_jsonrpc(ld, ld->rpc_filename);

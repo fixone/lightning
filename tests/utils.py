@@ -12,22 +12,25 @@ from ephemeral_port_reserve import reserve
 
 
 BITCOIND_CONFIG = {
+    "regtest": 1,
     "rpcuser": "rpcuser",
     "rpcpassword": "rpcpass",
-    "rpcport": 18332,
 }
 
 
 LIGHTNINGD_CONFIG = {
-    "bitcoind-poll": "1s",
     "log-level": "debug",
     "cltv-delta": 6,
     "cltv-final": 5,
-    "locktime-blocks": 5,
+    "watchtime-blocks": 5,
     "rescan": 1,
+    'disable-dns': None,
 }
 
-DEVELOPER = os.getenv("DEVELOPER", "0") == "1"
+with open('config.vars') as configfile:
+    config = dict([(line.rstrip().split('=', 1)) for line in configfile])
+
+DEVELOPER = os.getenv("DEVELOPER", config['DEVELOPER']) == "1"
 TIMEOUT = int(os.getenv("TIMEOUT", "60"))
 
 
@@ -39,10 +42,14 @@ def wait_for(success, timeout=TIMEOUT, interval=0.1):
         raise ValueError("Error waiting for {}", success)
 
 
-def write_config(filename, opts):
+def write_config(filename, opts, regtest_opts=None):
     with open(filename, 'w') as f:
         for k, v in opts.items():
             f.write("{}={}\n".format(k, v))
+        if regtest_opts:
+            f.write("[regtest]\n")
+            for k, v in regtest_opts.items():
+                f.write("{}={}\n".format(k, v))
 
 
 class TailableProc(object):
@@ -63,6 +70,10 @@ class TailableProc(object):
 
         # Should we be logging lines we read from stdout?
         self.verbose = verbose
+
+        # A filter function that'll tell us whether to filter out the line (not
+        # pass it to the log matcher and not print it to stdout).
+        self.log_filter = lambda line: False
 
     def start(self):
         """Start the underlying process and start monitoring it.
@@ -115,6 +126,8 @@ class TailableProc(object):
         for line in iter(self.proc.stdout.readline, ''):
             if len(line) == 0:
                 break
+            if self.log_filter(line.decode('ASCII')):
+                continue
             if self.verbose:
                 logging.debug("%s: %s", self.prefix, line.decode().rstrip())
             with self.logs_cond:
@@ -230,14 +243,16 @@ class BitcoinD(TailableProc):
             '-datadir={}'.format(bitcoin_dir),
             '-printtoconsole',
             '-server',
-            '-regtest',
             '-logtimestamps',
             '-nolisten',
         ]
+        # For up to and including 0.16.1, this needs to be in main section.
         BITCOIND_CONFIG['rpcport'] = rpcport
-        btc_conf_file = os.path.join(regtestdir, 'bitcoin.conf')
-        write_config(os.path.join(bitcoin_dir, 'bitcoin.conf'), BITCOIND_CONFIG)
-        write_config(btc_conf_file, BITCOIND_CONFIG)
+        # For after 0.16.1 (eg. 3f398d7a17f136cd4a67998406ca41a124ae2966), this
+        # needs its own [regtest] section.
+        BITCOIND_REGTEST = {'rpcport': rpcport}
+        btc_conf_file = os.path.join(bitcoin_dir, 'bitcoin.conf')
+        write_config(btc_conf_file, BITCOIND_CONFIG, BITCOIND_REGTEST)
         self.rpc = SimpleBitcoinProxy(btc_conf_file=btc_conf_file)
 
     def start(self):
@@ -264,7 +279,7 @@ class LightningD(TailableProc):
             'lightning-dir': lightning_dir,
             'addr': '127.0.0.1:{}'.format(port),
             'allow-deprecated-apis': 'false',
-            'override-fee-rates': '15000/7500/1000',
+            'default-fee-rate': 15000,
             'network': 'regtest',
             'ignore-fee-limits': 'false',
         }
@@ -282,9 +297,20 @@ class LightningD(TailableProc):
                 f.write(seed)
         if DEVELOPER:
             self.opts['dev-broadcast-interval'] = 1000
+            self.opts['dev-bitcoind-poll'] = 1
             # lightningd won't announce non-routable addresses by default.
             self.opts['dev-allow-localhost'] = None
         self.prefix = 'lightningd-%d' % (node_id)
+
+        filters = [
+            "Unable to estimate",
+            "No fee estimate",
+            "Connected json input",
+            "Forcing fee rate, ignoring estimate",
+        ]
+
+        filter_re = re.compile(r'({})'.format("|".join(filters)))
+        self.log_filter = lambda line: filter_re.search(line) is not None
 
     @property
     def cmd_line(self):
@@ -293,6 +319,9 @@ class LightningD(TailableProc):
         for k, v in sorted(self.opts.items()):
             if v is None:
                 opts.append("--{}".format(k))
+            elif isinstance(v, list):
+                for i in v:
+                    opts.append("--{}={}".format(k, i))
             else:
                 opts.append("--{}={}".format(k, v))
 
@@ -322,12 +351,22 @@ class LightningNode(object):
         self.may_fail = may_fail
         self.may_reconnect = may_reconnect
 
-    def openchannel(self, remote_node, capacity, addrtype="p2sh-segwit"):
+    def openchannel(self, remote_node, capacity, addrtype="p2sh-segwit", confirm=True, announce=True):
         addr, wallettxid = self.fundwallet(capacity, addrtype)
         fundingtx = self.rpc.fundchannel(remote_node.info['id'], capacity)
-        self.daemon.wait_for_log('sendrawtx exit 0, gave')
-        self.bitcoin.generate_block(6)
-        self.daemon.wait_for_log('to CHANNELD_NORMAL|STATE_NORMAL')
+
+        # Wait for the funding transaction to be in bitcoind's mempool
+        wait_for(lambda: fundingtx['txid'] in self.bitcoin.rpc.getrawmempool())
+
+        if confirm or announce:
+            self.bitcoin.generate_block(1)
+
+        if announce:
+            self.bitcoin.generate_block(5)
+
+        if confirm or announce:
+            self.daemon.wait_for_log(
+                r'Funding tx {} depth'.format(fundingtx['txid']))
         return {'address': addr, 'wallettxid': wallettxid, 'fundingtx': fundingtx}
 
     def fundwallet(self, sats, addrtype="p2sh-segwit"):
@@ -443,3 +482,21 @@ class LightningNode(object):
         # Intermittent decoding failure.  See if it decodes badly twice?
         decoded2 = self.bitcoin.rpc.decoderawtransaction(tx)
         raise ValueError("Can't find {} payment in {} (1={} 2={})".format(amount, tx, decoded, decoded2))
+
+    def subd_pid(self, subd):
+        """Get the process id of the given subdaemon, eg channeld or gossipd"""
+        ex = re.compile(r'lightning_{}.*: pid ([0-9]*),'.format(subd))
+        # Make sure we get latest one if it's restarted!
+        for l in reversed(self.daemon.logs):
+            group = ex.search(l)
+            if group:
+                return group.group(1)
+        raise ValueError("No daemon {} found".format(subd))
+
+    def is_channel_active(self, chanid):
+        channels = self.rpc.listchannels()['channels']
+        active = [(c['short_channel_id'], c['flags']) for c in channels if c['active']]
+        return (chanid, 0) in active and (chanid, 1) in active
+
+    def wait_channel_active(self, chanid):
+        wait_for(lambda: self.is_channel_active(chanid), interval=1)

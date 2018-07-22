@@ -1,4 +1,5 @@
 #include "bitcoin/block.h"
+#include "bitcoin/feerate.h"
 #include "bitcoin/script.h"
 #include "bitcoin/tx.h"
 #include "bitcoind.h"
@@ -16,7 +17,9 @@
 #include <common/timeout.h>
 #include <common/utils.h>
 #include <inttypes.h>
+#include <lightningd/channel_control.h>
 #include <lightningd/gossip_control.h>
+#include <lightningd/param.h>
 
 /* Mutual recursion via timer. */
 static void try_extend_tip(struct chain_topology *topo);
@@ -24,7 +27,8 @@ static void try_extend_tip(struct chain_topology *topo);
 static void next_topology_timer(struct chain_topology *topo)
 {
 	/* This takes care of its own lifetime. */
-	notleak(new_reltimer(topo->timers, topo, topo->poll_time,
+	notleak(new_reltimer(topo->timers, topo,
+			     time_from_sec(topo->poll_seconds),
 			     try_extend_tip, topo));
 }
 
@@ -34,7 +38,7 @@ static bool we_broadcast(const struct chain_topology *topo,
 	const struct outgoing_tx *otx;
 
 	list_for_each(&topo->outgoing_txs, otx, list) {
-		if (structeq(&otx->txid, txid))
+		if (bitcoin_txid_eq(&otx->txid, txid))
 			return true;
 	}
 	return false;
@@ -226,48 +230,6 @@ static const char *feerate_name(enum feerate feerate)
 /* Mutual recursion via timer. */
 static void next_updatefee_timer(struct chain_topology *topo);
 
-/* bitcoind considers 250 satoshi per kw to be the minimum acceptable fee:
- * less than this won't even relay.
- */
-#define BITCOIND_MINRELAYTXFEE_PER_KW 250
-/*
- * But bitcoind uses vbytes (ie. (weight + 3) / 4) for this
- * calculation, rather than weight, meaning we can disagree since we do
- * it sanely (as specified in BOLT #3).
- */
-#define FEERATE_BITCOIND_SEES(feerate, weight) \
-	(((feerate) * (weight)) / 1000 * 1000 / ((weight) + 3))
-/* ie. fee = (feerate * weight) // 1000
- * bitcoind needs (worst-case): fee * 1000 / (weight + 3) >= 4000
- *
- * (feerate * weight) // 1000 * 1000 // (weight + 3) >= 4000
- *
- * The feerate needs to be higher for lower weight, and our minimum tx weight
- * is 464 (version (4) + count_tx_in (1) + tx_in (32 + 4 + 1 + 4) +
- * count_tx_out (1) + amount (8) + P2WSH (1 + 1 + 32) + witness 1 + 1 + <sig>
- * + 1 + <key>).  Assume it's 400 to give a significant safety margin (it
- * only makes 1 difference in the result anyway).
- */
-#define MINIMUM_TX_WEIGHT 400
-/*
- * This formula is satisfied by a feerate of 4030 (hand-search).
- */
-#define FEERATE_FLOOR 253
-u32 feerate_floor(void)
-{
-	/* Assert that bitcoind will see this as above minRelayTxFee */
-	BUILD_ASSERT(FEERATE_BITCOIND_SEES(FEERATE_FLOOR, MINIMUM_TX_WEIGHT)
-		     >= BITCOIND_MINRELAYTXFEE_PER_KW);
-	/* And a lesser value won't do */
-	BUILD_ASSERT(FEERATE_BITCOIND_SEES(FEERATE_FLOOR-1, MINIMUM_TX_WEIGHT)
-		     < BITCOIND_MINRELAYTXFEE_PER_KW);
-	/* And I'm right about it being OK for larger txs, too */
-	BUILD_ASSERT(FEERATE_BITCOIND_SEES(FEERATE_FLOOR, (MINIMUM_TX_WEIGHT*2))
-		     >= BITCOIND_MINRELAYTXFEE_PER_KW);
-
-	return FEERATE_FLOOR;
-}
-
 /* We sanitize feerates if necessary to put them in descending order. */
 static void update_feerates(struct bitcoind *bitcoind,
 			    const u32 *satoshi_per_kw,
@@ -275,26 +237,49 @@ static void update_feerates(struct bitcoind *bitcoind,
 {
 	u32 old_feerates[NUM_FEERATES];
 	bool changed = false;
+	/* Smoothing factor alpha for simple exponential smoothing. The goal is to
+     * have the feerate account for 90 percent of the values polled in the last
+     * 2 minutes. The following will do that in a polling interval
+     * independent manner. */
+	double alpha = 1 - pow(0.1,(double)topo->poll_seconds / 120);
 
 	for (size_t i = 0; i < NUM_FEERATES; i++) {
 		u32 feerate = satoshi_per_kw[i];
 
-		if (feerate < feerate_floor())
-			feerate = feerate_floor();
+		/* Takes into account override_fee_rate */
+		old_feerates[i] = get_feerate(topo, i);
+
+		/* If estimatefee failed, don't do anything. */
+		if (!feerate)
+			continue;
+
+        /* Smooth the feerate to avoid spikes. */
+        u32 feerate_smooth = feerate * alpha + old_feerates[i] * (1 - alpha);
+        /* But to avoid updating forever, only apply smoothing when its
+         * effect is more then 10 percent */
+        if (abs((int)feerate - (int)feerate_smooth) > (0.1 * feerate)) {
+            feerate = feerate_smooth;
+            log_debug(topo->log,
+					  "...feerate %u smoothed to %u (alpha=%.2f)",
+					  satoshi_per_kw[i], feerate, alpha);
+        }
+
+        if (feerate < feerate_floor()) {
+            feerate = feerate_floor();
+            log_debug(topo->log,
+					  "...feerate %u hit floor %u",
+					  satoshi_per_kw[i], feerate);
+        }
 
 		if (feerate != topo->feerate[i]) {
 			log_debug(topo->log, "%s feerate %u (was %u)",
 				  feerate_name(i),
 				  feerate, topo->feerate[i]);
-			if (feerate != satoshi_per_kw[i])
-				log_debug(topo->log,
-					  "...feerate %u hit floor %u",
-					  satoshi_per_kw[i], feerate);
 		}
-		old_feerates[i] = topo->feerate[i];
 		topo->feerate[i] = feerate;
 	}
 
+	/* Make sure fee rates are in order. */
 	for (size_t i = 0; i < NUM_FEERATES; i++) {
 		for (size_t j = 0; j < i; j++) {
 			if (topo->feerate[j] < topo->feerate[i]) {
@@ -305,7 +290,7 @@ static void update_feerates(struct bitcoind *bitcoind,
 				topo->feerate[j] = topo->feerate[i];
 			}
 		}
-		if (topo->feerate[i] != old_feerates[i])
+		if (get_feerate(topo, i) != old_feerates[i])
 			changed = true;
 	}
 
@@ -331,7 +316,8 @@ static void start_fee_estimate(struct chain_topology *topo)
 static void next_updatefee_timer(struct chain_topology *topo)
 {
 	/* This takes care of its own lifetime. */
-	notleak(new_reltimer(topo->timers, topo, topo->poll_time,
+	notleak(new_reltimer(topo->timers, topo,
+			     time_from_sec(topo->poll_seconds),
 			     start_fee_estimate, topo));
 }
 
@@ -411,6 +397,7 @@ static void add_tip(struct chain_topology *topo, struct block *b)
 	filter_block_txs(topo, b);
 
 	block_map_add(&topo->block_map, b);
+	topo->max_blockheight = b->height;
 }
 
 static struct block *new_block(struct chain_topology *topo,
@@ -467,7 +454,7 @@ static void have_new_block(struct bitcoind *bitcoind UNUSED,
 			   struct chain_topology *topo)
 {
 	/* Unexpected predecessor?  Free predecessor, refetch it. */
-	if (!structeq(&topo->tip->blkid, &blk->hdr.prev_hash))
+	if (!bitcoin_blkid_eq(&topo->tip->blkid, &blk->hdr.prev_hash))
 		remove_tip(topo);
 	else
 		add_tip(topo, new_block(topo, blk, topo->tip->height + 1));
@@ -498,7 +485,7 @@ static void init_topo(struct bitcoind *bitcoind UNUSED,
 		      struct bitcoin_block *blk,
 		      struct chain_topology *topo)
 {
-	topo->root = new_block(topo, blk, topo->first_blocknum);
+	topo->root = new_block(topo, blk, topo->max_blockheight);
 	block_map_add(&topo->block_map, topo->root);
 	topo->tip = topo->prev_tip = topo->root;
 
@@ -522,32 +509,32 @@ static void get_init_blockhash(struct bitcoind *bitcoind, u32 blockcount,
 	/* If bitcoind's current blockheight is below the requested height, just
 	 * go back to that height. This might be a new node catching up, or
 	 * bitcoind is processing a reorg. */
-	if (blockcount < topo->first_blocknum) {
+	if (blockcount < topo->max_blockheight) {
 		if (bitcoind->ld->config.rescan < 0) {
 			/* Absolute blockheight, but bitcoind's blockheight isn't there yet */
 			/* Protect against underflow in subtraction.
 			 * Possible in regtest mode. */
 			if (blockcount < 1)
-				topo->first_blocknum = 0;
+				topo->max_blockheight = 0;
 			else
-				topo->first_blocknum = blockcount - 1;
-		} else if (topo->first_blocknum == UINT32_MAX) {
+				topo->max_blockheight = blockcount - 1;
+		} else if (topo->max_blockheight == UINT32_MAX) {
 			/* Relative rescan, but we didn't know the blockheight */
 			/* Protect against underflow in subtraction.
 			 * Possible in regtest mode. */
 			if (blockcount < bitcoind->ld->config.rescan)
-				topo->first_blocknum = 0;
+				topo->max_blockheight = 0;
 			else
-				topo->first_blocknum = blockcount - bitcoind->ld->config.rescan;
+				topo->max_blockheight = blockcount - bitcoind->ld->config.rescan;
 		}
 	}
 
 	/* Rollback to the given blockheight, so we start track
 	 * correctly again */
-	wallet_blocks_rollback(topo->wallet, topo->first_blocknum);
+	wallet_blocks_rollback(topo->wallet, topo->max_blockheight);
 
 	/* Get up to speed with topology. */
-	bitcoind_getblockhash(bitcoind, topo->first_blocknum,
+	bitcoind_getblockhash(bitcoind, topo->max_blockheight,
 			      get_init_block, topo);
 }
 
@@ -586,85 +573,62 @@ static u32 guess_feerate(const struct chain_topology *topo, enum feerate feerate
 
 u32 get_feerate(const struct chain_topology *topo, enum feerate feerate)
 {
-	if (topo->override_fee_rate) {
+#if DEVELOPER
+	if (topo->dev_override_fee_rate) {
 		log_debug(topo->log, "Forcing fee rate, ignoring estimate");
-		return topo->override_fee_rate[feerate];
-	} else if (topo->feerate[feerate] == 0) {
+		return topo->dev_override_fee_rate[feerate];
+	}
+#endif
+	if (topo->feerate[feerate] == 0) {
 		return guess_feerate(topo, feerate);
 	}
 	return topo->feerate[feerate];
 }
 
 #if DEVELOPER
-static void json_dev_blockheight(struct command *cmd,
-				 const char *buffer UNUSED, const jsmntok_t *params UNUSED)
-{
-	struct chain_topology *topo = cmd->ld->topology;
-	struct json_result *response;
-
-	response = new_json_result(cmd);
-	json_object_start(response, NULL);
-	json_add_num(response, "blockheight", get_block_height(topo));
-	json_object_end(response);
-	command_success(cmd, response);
-}
-
-static const struct json_command dev_blockheight = {
-	"dev-blockheight",
-	json_dev_blockheight,
-	"Show current block height"
-};
-AUTODATA(json_command, &dev_blockheight);
-
 static void json_dev_setfees(struct command *cmd,
 			     const char *buffer, const jsmntok_t *params)
 {
-	jsmntok_t *ratetok[NUM_FEERATES];
 	struct chain_topology *topo = cmd->ld->topology;
 	struct json_result *response;
 
-	if (!json_get_params(cmd, buffer, params,
-			     "?immediate", &ratetok[FEERATE_IMMEDIATE],
-			     "?normal", &ratetok[FEERATE_NORMAL],
-			     "?slow", &ratetok[FEERATE_SLOW],
-			     NULL)) {
-		return;
-	}
-
-	if (!topo->override_fee_rate) {
+	if (!topo->dev_override_fee_rate) {
 		u32 fees[NUM_FEERATES];
 		for (size_t i = 0; i < ARRAY_SIZE(fees); i++)
 			fees[i] = get_feerate(topo, i);
-		topo->override_fee_rate = tal_dup_arr(topo, u32, fees,
-						      ARRAY_SIZE(fees), 0);
+		topo->dev_override_fee_rate = tal_dup_arr(topo, u32, fees,
+							  ARRAY_SIZE(fees), 0);
 	}
-	for (size_t i = 0; i < NUM_FEERATES; i++) {
-		if (!ratetok[i])
-			continue;
-		if (!json_tok_number(buffer, ratetok[i],
-				     &topo->override_fee_rate[i])) {
-			command_fail(cmd, "Invalid feerate %.*s",
-				     ratetok[i]->end - ratetok[i]->start,
-				     buffer + ratetok[i]->start);
-			return;
-		}
-	}
+
+	if (!param(cmd, buffer, params,
+		   p_opt_def("immediate", json_tok_number,
+			     &topo->dev_override_fee_rate[FEERATE_IMMEDIATE],
+			     topo->dev_override_fee_rate[FEERATE_IMMEDIATE]),
+		   p_opt_def("normal", json_tok_number,
+			     &topo->dev_override_fee_rate[FEERATE_NORMAL],
+			     topo->dev_override_fee_rate[FEERATE_NORMAL]),
+		   p_opt_def("slow", json_tok_number,
+			     &topo->dev_override_fee_rate[FEERATE_SLOW],
+			     topo->dev_override_fee_rate[FEERATE_SLOW]),
+		   NULL))
+		return;
+
 	log_debug(topo->log,
 		  "dev-setfees: fees now %u/%u/%u",
-		  topo->override_fee_rate[FEERATE_IMMEDIATE],
-		  topo->override_fee_rate[FEERATE_NORMAL],
-		  topo->override_fee_rate[FEERATE_SLOW]);
+		  topo->dev_override_fee_rate[FEERATE_IMMEDIATE],
+		  topo->dev_override_fee_rate[FEERATE_NORMAL],
+		  topo->dev_override_fee_rate[FEERATE_SLOW]);
 
 	notify_feerate_change(cmd->ld);
 
 	response = new_json_result(cmd);
 	json_object_start(response, NULL);
 	json_add_num(response, "immediate",
-		     topo->override_fee_rate[FEERATE_IMMEDIATE]);
+		     topo->dev_override_fee_rate[FEERATE_IMMEDIATE]);
 	json_add_num(response, "normal",
-		     topo->override_fee_rate[FEERATE_NORMAL]);
+		     topo->dev_override_fee_rate[FEERATE_NORMAL]);
 	json_add_num(response, "slow",
-		     topo->override_fee_rate[FEERATE_SLOW]);
+		     topo->dev_override_fee_rate[FEERATE_SLOW]);
 	json_object_end(response);
 	command_success(cmd, response);
 }
@@ -717,21 +681,25 @@ struct chain_topology *new_topology(struct lightningd *ld, struct log *log)
 	txowatch_hash_init(&topo->txowatches);
 	topo->log = log;
 	topo->default_fee_rate = 40000;
-	topo->override_fee_rate = NULL;
+	memset(topo->feerate, 0, sizeof(topo->feerate));
 	topo->bitcoind = new_bitcoind(topo, ld, log);
 	topo->wallet = ld->wallet;
+	topo->poll_seconds = 30;
+#if DEVELOPER
+	topo->dev_override_fee_rate = NULL;
+#endif
 	return topo;
 }
 
 void setup_topology(struct chain_topology *topo,
 		    struct timers *timers,
-		    struct timerel poll_time, u32 first_blocknum)
+		    u32 min_blockheight, u32 max_blockheight)
 {
 	memset(&topo->feerate, 0, sizeof(topo->feerate));
 	topo->timers = timers;
-	topo->poll_time = poll_time;
 
-	topo->first_blocknum = first_blocknum;
+	topo->min_blockheight = min_blockheight;
+	topo->max_blockheight = max_blockheight;
 
 	/* Make sure bitcoind is started, and ready */
 	wait_for_bitcoind(topo->bitcoind);

@@ -3,6 +3,12 @@ import logging
 import socket
 
 
+class RpcError(ValueError):
+    def __init__(self, description, error=None):
+        super(ValueError, self).__init__(description)
+        self.error = error
+
+
 class UnixDomainSocketRpc(object):
     def __init__(self, socket_path, executor=None, logger=logging):
         self.socket_path = socket_path
@@ -23,6 +29,10 @@ class UnixDomainSocketRpc(object):
                 buff += b
                 if len(b) == 0:
                     return {'error': 'Connection to RPC server lost.'}
+
+                if buff[-3:] != b' }\n':
+                    continue
+
                 # Convert late to UTF-8 so glyphs split across recvs do not
                 # impact us
                 objs, _ = self.decoder.raw_decode(buff.decode("UTF-8"))
@@ -63,12 +73,12 @@ class UnixDomainSocketRpc(object):
 
         self.logger.debug("Received response for %s call: %r", method, resp)
         if "error" in resp:
-            raise ValueError(
-                "RPC call failed: {}, method: {}, payload: {}".format(
-                    resp["error"],
+            raise RpcError(
+                "RPC call failed: method: {}, payload: {}, error: {}".format(
                     method,
-                    payload
-                ))
+                    payload,
+                    resp['error']
+                ), resp['error'])
         elif "result" not in resp:
             raise ValueError("Malformed response, \"result\" missing.")
         return resp["result"]
@@ -99,12 +109,6 @@ class LightningRpc(UnixDomainSocketRpc):
         res = self.call("listpeers", payload)
         return res.get("peers") and res["peers"][0] or None
 
-    def dev_blockheight(self):
-        """
-        Show current block height
-        """
-        return self.call("dev-blockheight")
-
     def dev_setfees(self, immediate=None, normal=None, slow=None):
         """
         Set feerate in satoshi-per-kw for {immediate}, {normal} and {slow}
@@ -128,16 +132,22 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("listnodes", payload)
 
-    def getroute(self, peer_id, msatoshi, riskfactor, cltv=9):
+    def getroute(self, peer_id, msatoshi, riskfactor, cltv=9, fromid=None, fuzzpercent=None, seed=None):
         """
         Show route to {id} for {msatoshi}, using {riskfactor} and optional
-        {cltv} (default 9)
+        {cltv} (default 9). If specified search from {fromid} otherwise use
+        this node as source. Randomize the route with up to {fuzzpercent}
+        (0.0 -> 100.0, default 5.0) using {seed} as an arbitrary-size string
+        seed.
         """
         payload = {
             "id": peer_id,
             "msatoshi": msatoshi,
             "riskfactor": riskfactor,
-            "cltv": cltv
+            "cltv": cltv,
+            "fromid": fromid,
+            "fuzzpercent": fuzzpercent,
+            "seed": seed
         }
         return self.call("getroute", payload)
 
@@ -248,6 +258,16 @@ class LightningRpc(UnixDomainSocketRpc):
         Crash lightningd by calling fatal()
         """
         return self.call("dev-crash")
+
+    def dev_query_scids(self, id, scids):
+        """
+        Ask peer for a particular set of scids
+        """
+        payload = {
+            "id": id,
+            "scids": scids
+        }
+        return self.call("dev-query-scids", payload)
 
     def getinfo(self):
         """
@@ -435,7 +455,7 @@ class LightningRpc(UnixDomainSocketRpc):
 
     def disconnect(self, peer_id):
         """
-        Show peer with {peer_id}, if {level} is set, include {log}s
+        Disconnect from peer with {peer_id}
         """
         payload = {
             "id": peer_id,

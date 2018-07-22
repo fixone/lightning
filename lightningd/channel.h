@@ -79,7 +79,7 @@ struct channel {
 	struct channel_info channel_info;
 
 	/* Secret seed (FIXME: Move to hsm!) */
-	struct privkey seed;
+	struct secret seed;
 
 	/* Their scriptpubkey if they sent shutdown. */
 	u8 *remote_shutdown_scriptpubkey;
@@ -92,7 +92,7 @@ struct channel {
 
 	/* Blockheight at creation, scans for funding confirmations
 	 * will start here */
-	u64 first_blocknum;
+	u32 first_blocknum;
 
 	/* Feerate range */
 	u32 min_possible_feerate, max_possible_feerate;
@@ -203,7 +203,7 @@ static inline bool channel_active(const struct channel *channel)
 		&& !channel_on_chain(channel);
 }
 
-void derive_channel_seed(struct lightningd *ld, struct privkey *seed,
+void derive_channel_seed(struct lightningd *ld, struct secret *seed,
 			 const struct pubkey *peer_id,
 			 const u64 dbid);
 

@@ -228,7 +228,7 @@ s64 wallet_get_newindex(struct lightningd *ld);
 bool wallet_shachain_add_hash(struct wallet *wallet,
 			      struct wallet_shachain *chain,
 			      uint64_t index,
-			      const struct sha256 *hash);
+			      const struct secret *hash);
 
 /**
  * wallet_shachain_load -- Load an existing shachain from the wallet.
@@ -316,13 +316,15 @@ void wallet_channel_stats_load(struct wallet *w, u64 cdbid, struct channel_stats
 /**
  * Retrieve the blockheight of the last block processed by lightningd.
  *
- * Will return either the maximal blockheight or the default value if the wallet
- * was never used before.
+ * Will set min/max either the minimal/maximal blockheight or the default value
+ * if the wallet was never used before.
  *
  * @w: wallet to load from.
  * @def: the default value to return if we've never used the wallet before
+ * @min(out): height of the first block we track
+ * @max(out): height of the last block we added
  */
-u32 wallet_blocks_height(struct wallet *w, u32 def);
+void wallet_blocks_heights(struct wallet *w, u32 def, u32 *min, u32 *max);
 
 /**
  * wallet_extract_owned_outputs - given a tx, extract all of our outputs
